@@ -1,7 +1,7 @@
 # Private and public access
 
 This page is for operators: which networks a Flats host serves on, how to turn
-on Tailscale, Tailscale Funnel and Portal, and how visibility works. The
+on Tailscale, Tailscale Funnel, Portal and zrok, and how visibility works. The
 provider state machine is in [Network provider lifecycle](network-provider-lifecycle.md).
 
 ## Providers
@@ -12,6 +12,7 @@ provider state machine is in [Network provider lifecycle](network-provider-lifec
 | Tailscale | Private | Devices your tailnet ACLs allow |
 | Tailscale Funnel | Public | Anyone on the internet |
 | Portal | Public | Anyone on the internet, through a Portal relay |
+| zrok | Public | Anyone on the internet, through a zrok public share on your zrok account |
 
 The default network is Local; every other provider is off. A provider serves a
 flat only when both of these are on:
@@ -49,7 +50,7 @@ the start, so its private and preview links use the tailnet:
   routes of every flat created afterwards, including flats an agent creates.
 - Each grant is logged as a `provider` event. Turn it off under the flat's
   Networks to keep a flat on the host only.
-- It never allows Funnel or Portal. Flats created earlier keep their
+- It never allows Funnel, Portal or zrok. Flats created earlier keep their
   providers.
 
 Flats embeds tsnet. Permitted flat and preview routes, and the console in
@@ -77,6 +78,32 @@ open the console from another device, such as over the tailnet, it shows Local
 links as "server only" text instead of links, because they would open that
 device rather than the Flats host.
 
+## Publishing through zrok
+
+Under **Settings → Network providers → zrok**, paste your zrok account token
+and choose **Connect**. The token is on myzrok.io: open the zrok API console
+and copy it from the getting-started wizard. Flats registers this machine as
+an environment of the account and keeps the token in its data directory; no
+zrok CLI is needed. The panel then shows the connected environment's ID and
+zrok service, and **Turn on** makes zrok available; allow it on a flat to use
+it. To switch to another token, for example after regenerating it, enter it
+under **Replace with a new account token**: the current account stays
+connected if the new token is refused, and replacing is refused while a flat
+is public through zrok. **Disconnect account** unregisters the environment
+and deletes the token; turn zrok off first. If zrok refuses the stored token
+(for example after you regenerated it), the console says so and offers to
+forget the account on this machine; remove the environment it names in the
+zrok console. Replacing works after a regenerated token: the new token
+unregisters the old environment of the same account. Each flat served through zrok reserves its slug as a name in
+`zrok.namespace` (default `public`), so its URL survives restarts, and the
+share exists only while the flat is public. A name already reserved in your
+zrok account by something other than this host is refused. On the free zrok
+plan, a visitor's browser first sees a zrok warning page with a **Visit
+Share** button, once per visitor; programs can skip it with a
+`skip_zrok_interstitial` request header. See
+[Configuration and storage](configuration.md) for `zrok.environment` and
+`zrok.namespace`.
+
 ## Visibility
 
 Visibility is Private or Public, independently of publication and connection
@@ -84,7 +111,7 @@ state.
 
 - **Private** routes use Local, or permitted Tailscale with existing tailnet
   ACLs.
-- **Public** routes use explicitly permitted Portal or Tailscale Funnel.
+- **Public** routes use explicitly permitted Portal, zrok or Tailscale Funnel.
   Public is not access control: anyone with the URL can open the flat.
 
 Configuration alone never publishes a version or changes visibility. Public
@@ -135,4 +162,4 @@ Tailscale choice:
   host Tailscale grant never opts those flats in.
 
 Existing explicit denials win; new flats and later revocations are never opted
-in by restart. Neither choice grants Funnel or Portal.
+in by restart. Neither choice grants Funnel, Portal or zrok.

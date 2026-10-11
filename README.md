@@ -12,7 +12,8 @@
 
 Flats lets agents deploy sites and small server apps directly to your own
 machine. Flats are Private by default, through local loopback or permitted
-Tailscale, and optionally Public through permitted Portal or Tailscale Funnel.
+Tailscale, and optionally Public through permitted Portal, zrok or Tailscale
+Funnel.
 There is no hosted Flats control plane.
 
 Your machine runs the code and keeps the versions, SQLite databases,
@@ -152,7 +153,7 @@ under Networks on the flat's Settings tab:
 | Visibility | Providers |
 | --- | --- |
 | Private | Local (always on), Tailscale (tailnet ACLs decide access) |
-| Public | Tailscale Funnel, Portal |
+| Public | Tailscale Funnel, Portal, zrok |
 
 Permitting a network never publishes a version or changes visibility, and
 Tailscale does not imply Funnel. Making a flat Public needs a published

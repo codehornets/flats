@@ -44,6 +44,8 @@ OS user configuration directory under `flats-client/`, only the CLI and
     restore-journal.json      present only while a data restore is unfinished
     health-check/ restore-trial/  temporary copies
   tsnet/ portal/              provider node identities
+  zrok/                       zrok names this host reserved, until released
+  zrok-environment/           the connected zrok account: token and identity (mode 0600)
   network-retirements/        unfinished tailnet node cleanup
   logs/ cache/ run/ flats.lock  logs, caches, sockets, the host lock
 ```
@@ -57,7 +59,8 @@ Required: `config.json`, `flats.db` (with `VACUUM INTO` or while the host is
 stopped, never a plain copy of a live database), `secret.key` together with
 `flats.db`, `flats/<slug>/` except the temporary copies, `restore-journal.json`
 and `network-retirements/` when present, and `tsnet/` and `portal/` (without
-them new node names and certificates are issued). Back up the credential files
+them new node names and certificates are issued), and `zrok/` (without it a
+deleted flat no longer releases its zrok name). Back up the credential files
 separately. Logs, caches, sockets and the lock are rebuilt.
 
 Restore with the same or a newer Flats release: an older binary refuses a newer
@@ -111,6 +114,8 @@ written; `flats config unset KEY` removes it.
 | `portal.discovery` | `true`; `false` needs relays | restart |
 | `portal.max_active_relays` | `3` | restart |
 | `portal.hide` | `false` (public flats appear in relay listings) | immediately; relays follow at their next lease renewal |
+| `zrok.environment` | none (Flats manages `zrok-environment/` in the data directory) | restart, or when zrok is turned on from the console |
+| `zrok.namespace` | `public` | restart, or when zrok is turned on from the console |
 | `credentials.operator_file` | none; ignored (the operator credential is no longer used) | — |
 | `credentials.tailscale_authkey_file` | none (interactive login) | restart |
 
@@ -142,6 +147,42 @@ what Flats asks the relays for: a served route's lease metadata changes at
 once, and relays apply it at their next lease renewal (up to about 90
 seconds). If that update fails, the choice stays saved, the flat logs the
 error and the next activation of the route retries it.
+
+zrok serves public flats as zrok public shares on the operator's zrok
+account. Connect the account in the console (Settings → Network providers →
+zrok) with its account token: Flats registers this machine as an environment
+of the account, as `zrok2 enable` would, and keeps the token and identity in
+`zrok-environment/` in the data directory (mode 0600). The token is never
+shown again, logged or written to `config.json`; the console shows only the
+environment ID and zrok service. A new token replaces the account (staged
+next to the directory, so a refused token keeps the current one; refused
+while a flat is public through zrok), and name records whose reservation the
+new account holds with the same creation time move to it. Disconnect
+unregisters the environment and deletes it. To use an environment managed with the zrok CLI
+instead, set `zrok.environment` to its directory; the console then cannot
+connect or disconnect it. With `zrok` in `network.permitted` and no connected
+account, the host still starts and zrok stays unconfigured until one is
+connected. Each flat
+served through zrok reserves its slug as a name in `zrok.namespace`, so its
+public URL stays the same across restarts and Private↔Public changes; the
+share itself exists only while the flat is public and the host runs.
+Deleting a flat, or the expiry of a rename redirect, releases the name, also
+when the flat went private or lost its zrok permission earlier: `zrok/` in
+the data directory records every name the host reserved, and deleting such a
+flat while zrok is turned off is refused until zrok is on again. Flats only
+uses, removes and releases names and shares it created itself: a name already
+reserved in your account by the zrok CLI or another Flats host is refused
+(release it with `zrok2 delete name` or rename the flat), and a share you run
+under a name Flats reserved is left alone. Changing `zrok.environment` to
+another zrok account keeps the old account's records: flats using them report
+the conflict until you switch back, or remove the record in `zrok/`. zrok
+identifies an account only by its token, so after regenerating the token of
+the same account, release such names with `zrok2 delete name` and remove
+their records. A name another zrok
+account already owns cannot be used; rename the flat. When the account's
+name limit is reached, the route reports the zrok controller's reason. The
+zrok client also honors its own `ZROK2_*` environment variables, such as
+`ZROK2_API_ENDPOINT` for a self-hosted zrok instance.
 
 Parsing is strict: UTF-8, at most 1 MiB, no duplicate or unknown keys, no
 `null`, integers written as plain integers. One invalid value rejects the whole
@@ -249,7 +290,7 @@ written to the file.
 
 It refuses, writing nothing but the lock, when the directory already holds
 Flats data: a `flats.db` (convert a legacy one with `flats config migrate`),
-or any of `flats/`, `secret.key`, `tsnet/`, `portal/`, `backups/`,
+or any of `flats/`, `secret.key`, `tsnet/`, `portal/`, `zrok/`, `backups/`,
 `network-retirements/` or `network-provider.json` without a database (restore
 the database and config from the same backup). Other entries, such as a new
 volume's `lost+found`, are fine. A bootstrap interrupted after writing

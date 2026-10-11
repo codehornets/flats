@@ -96,6 +96,10 @@ and set `credentials.tailscale_authkey_file` to
 `/run/secrets/tailscale-authkey`. A host started from `config.json` refuses
 `TS_AUTHKEY` and other `TS_*` variables.
 
+For zrok, connect the account in the console with its account token. Flats
+keeps the zrok environment in `zrok-environment/` on the data volume, so it
+survives container restarts.
+
 ## Configuration
 
 `flats config set` and `unset` work offline and refuse while the host runs.
