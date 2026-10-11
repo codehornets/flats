@@ -101,6 +101,7 @@ func closedSocket(t *testing.T, x *socket) {
 	}
 }
 func TestHostSavedDocumentRunsAtOnce(t *testing.T) {
+	t.Parallel()
 	s, private, _ := hostService(t)
 	if _, err := s.OpenPreview(t.Context(), "host-doc", 0); !errors.Is(err, core.ErrDocsUnversioned) {
 		t.Fatal("document preview:", err)
@@ -125,6 +126,7 @@ func TestHostSavedDocumentRunsAtOnce(t *testing.T) {
 	}
 }
 func TestHostPublicSocketRevocation(t *testing.T) {
+	t.Parallel()
 	for _, action := range []string{"private", "delete", "rename"} {
 		t.Run(action, func(t *testing.T) {
 			s, private, public := hostService(t)
@@ -169,6 +171,7 @@ func TestHostPublicSocketRevocation(t *testing.T) {
 }
 
 func TestHostAPIAndMCPConflictRecovery(t *testing.T) {
+	t.Parallel()
 	s, private, _ := hostService(t)
 	srv := httptest.NewServer(private.handler("host-doc"))
 	defer srv.Close()

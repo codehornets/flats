@@ -66,6 +66,7 @@ func TestFullRewriteActivation(t *testing.T) {
 }
 
 func TestCapacityRejectionKeepsOtherEditor(t *testing.T) {
+	t.Parallel()
 	a := startApp(t, t.TempDir(), initialText, "v1")
 	bad := connect(t, a.srv.URL, "private")
 	bad.hello(t, nil)
@@ -89,6 +90,7 @@ func TestCapacityRejectionKeepsOtherEditor(t *testing.T) {
 }
 
 func TestPublicPresenceIsPrivate(t *testing.T) {
+	t.Parallel()
 	a := startApp(t, t.TempDir(), initialText, "v1")
 	editor := connect(t, a.srv.URL, "private")
 	editor.hello(t, nil)
@@ -117,6 +119,7 @@ func TestPublicPresenceIsPrivate(t *testing.T) {
 }
 
 func TestPublicReadsDoNotReserveWriter(t *testing.T) {
+	t.Parallel()
 	a := startApp(t, t.TempDir(), initialText, "v1")
 	a.document(t)
 	viewer := connect(t, a.srv.URL, "public")
@@ -138,6 +141,7 @@ func TestPublicReadsDoNotReserveWriter(t *testing.T) {
 }
 
 func TestHealthActivatesEveryDocumentAtomically(t *testing.T) {
+	t.Parallel()
 	data := t.TempDir()
 	old := startApp(t, data, initialText, "v1")
 	old.document(t)
@@ -160,6 +164,7 @@ func TestHealthActivatesEveryDocumentAtomically(t *testing.T) {
 }
 
 func TestPublicCapacityDoesNotConsumeEditors(t *testing.T) {
+	t.Parallel()
 	a := startApp(t, t.TempDir(), initialText, "v1")
 	for i := 0; i < 10; i++ {
 		connect(t, a.srv.URL, "public").hello(t, nil)
@@ -239,6 +244,7 @@ func TestAuthorizedUpdatesConsumeWriterBudget(t *testing.T) {
 }
 
 func TestRejectedRoomOtherWorkerCompaction(t *testing.T) {
+	t.Parallel()
 	data := t.TempDir()
 	a := startApp(t, data, initialText, "v1")
 	observer := connect(t, a.srv.URL, "private")
@@ -274,6 +280,7 @@ func TestRejectedRoomOtherWorkerCompaction(t *testing.T) {
 }
 
 func TestInternalVMErrorResync(t *testing.T) {
+	t.Parallel()
 	a := startApp(t, t.TempDir(), initialText, "v1")
 	editor := connect(t, a.srv.URL, "private")
 	editor.hello(t, nil)

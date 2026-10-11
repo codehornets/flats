@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+// Serial: one codec request runs for seconds against the request timeout, so
+// it must not compete with parallel tests for CPU. CI runs it in its own shard.
 func TestLargeHostAndCodecOwnership(t *testing.T) {
 	count := 50
 	if os.Getenv("FLATS_FULL_SOAK") == "1" {
@@ -31,6 +33,7 @@ func TestLargeHostAndCodecOwnership(t *testing.T) {
 }
 
 func TestLargeResponseOwnership(t *testing.T) {
+	t.Parallel()
 	f := mustStart(t, newManager(t), "large-response", map[string]string{"index.js": `const text="x".repeat(1048576);export default {fetch(){return new Response(text)}};`}, "index.js", nil)
 	for i := 0; i < 100; i++ {
 		r := f.do(t, "GET", "/", "")
