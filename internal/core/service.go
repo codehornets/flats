@@ -204,6 +204,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 	if err := s.restore(ctx); err != nil {
 		return nil, err
 	}
+	s.startSavedDocs(ctx)
 	s.cleanupDocs()
 	s.wg.Add(1)
 	go s.sweeper()
@@ -579,6 +580,10 @@ type FlatView struct {
 	Versions      int            `json:"versions"`
 	DiskBytes     int64          `json:"disk_bytes"`
 	Thumbnail     string         `json:"thumbnail,omitempty"`
+	// Running reports whether a version is serving now on this host: false
+	// when the live version could not start (for example after a restart),
+	// even though LiveVersion still names it.
+	Running bool `json:"running"`
 	// Publication is unpublished until the first successful activation, then
 	// published. It does not follow connection state.
 	Publication     string             `json:"publication"`
@@ -611,6 +616,10 @@ const PendingPublicAccessNotice = "If approved, this flat becomes Public: anyone
 
 func (s *Service) view(ctx context.Context, f store.Flat) FlatView {
 	v := FlatView{Flat: f, PrivateURL: s.cfg.Private.URL(f.Slug)}
+	s.mu.Lock()
+	lf := s.live[f.Slug]
+	s.mu.Unlock()
+	v.Running = lf != nil && lf.cur.Load() != nil
 	v.PrivateState, v.PrivateDetail = s.hostState(f.Slug)
 	if f.Visibility.Public() {
 		v.PublicNotice = PublicAccessNotice
@@ -710,11 +719,12 @@ func (s *Service) view(ctx context.Context, f store.Flat) FlatView {
 			}
 		}
 	}
+	// The running version decides the type, as in isDocs; the Draft only
+	// while nothing runs.
 	v.Type = contenttype.Flat
 	if v.Live != nil {
 		v.Type = contenttype.FromManifest(v.Live.Manifest)
-	}
-	if v.Draft != nil {
+	} else if v.Draft != nil {
 		v.Type = contenttype.FromManifest(v.Draft.Manifest)
 	}
 	v.DiskBytes = dirSize(s.flatDir(f.Slug))
@@ -838,13 +848,16 @@ func (s *Service) SaveVersion(ctx context.Context, slugName string, files []bund
 	if m.Kind == "server" && s.cfg.Runtime == nil {
 		return store.Version{}, &bundle.ValidationError{Problems: []bundle.Problem{{Path: bundle.ManifestName, Message: "server flats are not enabled on this host", Fix: `deploy a static build ("kind": "static")`}}}
 	}
+	docs := m.Type == contenttype.Docs
 	unlock := s.lock(slugName)
 	defer unlock()
-	if _, err := s.st.GetFlat(ctx, slugName); errors.Is(err, store.ErrNotFound) {
+	if f, err := s.st.GetFlat(ctx, slugName); errors.Is(err, store.ErrNotFound) {
 		if _, err := s.createFlatLocked(ctx, slugName, m.Name, via); err != nil && !errors.Is(err, store.ErrExists) {
 			return store.Version{}, err
 		}
 	} else if err != nil {
+		return store.Version{}, err
+	} else if err := s.checkTypeChange(ctx, f, docs); err != nil {
 		return store.Version{}, err
 	}
 	var size int64
@@ -856,12 +869,25 @@ func (s *Service) SaveVersion(ctx context.Context, slugName string, files []bund
 			return store.Version{}, &bundle.ValidationError{Problems: []bundle.Problem{{Message: fmt.Sprintf("flat would use %d bytes, over its %d-byte disk quota", used+size, quota), Fix: "delete old versions/data, or raise the per-flat disk quota in system settings"}}}
 		}
 	}
-	return s.saveDraftLocked(ctx, slugName, files, meta, via)
+	v, err := s.saveDraftLocked(ctx, slugName, files, meta, via)
+	if err != nil || !docs {
+		return v, err
+	}
+	// A document has no publish step: its save runs at once, Private
+	// unless the operator already approved Public.
+	if err := s.applyDocsLocked(ctx, slugName, v.Revision, via); err != nil {
+		return v, err
+	}
+	return v, nil
 }
 
-// ListVersions returns versions newest first.
+// ListVersions returns versions newest first. A document has none.
 func (s *Service) ListVersions(ctx context.Context, slugName string) ([]store.Version, error) {
-	if _, err := s.st.GetFlat(ctx, slugName); err != nil {
+	f, err := s.st.GetFlat(ctx, slugName)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.refuseDocs(ctx, f); err != nil {
 		return nil, err
 	}
 	return s.st.ListVersions(ctx, slugName)
@@ -907,12 +933,20 @@ func (s *Service) pruneVersions(ctx context.Context, slugName string) {
 // live version is kept on top of keep, and so are the versions of open
 // previews when keepPreviewed is set.
 func (s *Service) prunableVersions(ctx context.Context, slugName string, keep int, keepPreviewed bool) ([]int, error) {
-	if keep <= 0 {
-		return nil, nil
-	}
 	f, err := s.st.GetFlat(ctx, slugName)
 	if err != nil {
 		return nil, err
+	}
+	// A document has no versions to go back to, so keep_versions does not
+	// apply: keep the running bundle and the one before it, which a draining
+	// runtime may still serve assets from.
+	if docs, err := s.isDocs(ctx, f); err != nil {
+		return nil, err
+	} else if docs {
+		keep = 1
+	}
+	if keep <= 0 {
+		return nil, nil
 	}
 	vs, err := s.st.ListVersions(ctx, slugName)
 	if err != nil {
@@ -978,9 +1012,22 @@ type DeployError struct {
 	DataImpact string
 	HealthData string
 	LiveData   string
+	// Document marks a saved document that could not start, which has no
+	// version to name.
+	Document bool
 }
 
 func (e *DeployError) Error() string {
+	if e.Document {
+		tail := "(the document keeps running with its previous text)"
+		if e.Previous == 0 {
+			tail = "(the document is not running yet)"
+		}
+		if e.Cause != nil {
+			return fmt.Sprintf("the saved document could not start: %v %s", e.Cause, tail)
+		}
+		return fmt.Sprintf("the saved document failed its health check: GET %s returned %d %s %s", e.Health.Path, e.Health.Status, e.Health.Error, tail)
+	}
 	tail := "(the previous live version keeps serving)"
 	if e.Previous == 0 {
 		tail = "(nothing was live before, so the flat is still not deployed)"
@@ -1124,7 +1171,7 @@ func (s *Service) deployLocked(ctx context.Context, f store.Flat, n int, kind st
 func (s *Service) activate(ctx context.Context, f store.Flat, d *deployed, h HealthResult, kind string, via Via, approvalID string, start time.Time) (DeployResult, error) {
 	slugName, n, prev := f.Slug, d.version.Number, f.LiveVersion
 	var commitErr error
-	if kind == "publish" {
+	if kind == "publish" || kind == "save" {
 		commitErr = s.st.CommitPublished(ctx, d.version, prev, approvalID, s.now())
 	} else {
 		commitErr = s.st.SetLive(ctx, slugName, n, prev, kind, approvalID, s.now())
@@ -1161,7 +1208,11 @@ func (s *Service) activate(ctx context.Context, f store.Flat, d *deployed, h Hea
 		s.Event(ctx, slugName, "error", "exposure", err.Error(), nil)
 	}
 	_ = s.dropPreviews(ctx, slugName)
-	s.Event(ctx, slugName, "info", "deploy", fmt.Sprintf("%s: version %d is live (was %d) via %s", kind, n, prev, via), map[string]int{"version": n, "previous": prev})
+	if kind == "save" {
+		s.Event(ctx, slugName, "info", "deploy", fmt.Sprintf("document saved and running via %s", via), map[string]int{"version": n, "previous": prev})
+	} else {
+		s.Event(ctx, slugName, "info", "deploy", fmt.Sprintf("%s: version %d is live (was %d) via %s", kind, n, prev, via), map[string]int{"version": n, "previous": prev})
+	}
 	s.pruneVersions(ctx, slugName)
 	fv, _ := s.st.GetFlat(ctx, slugName)
 	impact, live := "none", "untouched"
@@ -1716,7 +1767,9 @@ const maxPreviews = 5
 func (s *Service) OpenPreview(ctx context.Context, slugName string, n int) (PreviewView, error) {
 	unlock := s.lock(slugName)
 	defer unlock()
-	if _, err := s.st.GetFlat(ctx, slugName); err != nil {
+	if f, err := s.st.GetFlat(ctx, slugName); err != nil {
+		return PreviewView{}, err
+	} else if err := s.refuseDocs(ctx, f); err != nil {
 		return PreviewView{}, err
 	}
 	if n == 0 {
