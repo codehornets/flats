@@ -46,6 +46,7 @@ OS user configuration directory under `flats-client/`, only the CLI and
   tsnet/ portal/              provider node identities
   zrok/                       zrok names this host reserved, until released
   zrok-environment/           the connected zrok account: token and identity (mode 0600)
+  cloudflare-quick/           Cloudflare quick tunnel credentials per flat (mode 0600)
   network-retirements/        unfinished tailnet node cleanup
   logs/ cache/ run/ flats.lock  logs, caches, sockets, the host lock
 ```
@@ -60,7 +61,9 @@ stopped, never a plain copy of a live database), `secret.key` together with
 `flats.db`, `flats/<slug>/` except the temporary copies, `restore-journal.json`
 and `network-retirements/` when present, and `tsnet/` and `portal/` (without
 them new node names and certificates are issued), and `zrok/` (without it a
-deleted flat no longer releases its zrok name). Back up the credential files
+deleted flat no longer releases its zrok name). `cloudflare-quick/` is
+optional: without it each public flat's quick tunnel gets a new random
+address. Back up the credential files
 separately. Logs, caches, sockets and the lock are rebuilt.
 
 Restore with the same or a newer Flats release: an older binary refuses a newer
@@ -133,7 +136,7 @@ flat allowed on Tailscale when it is created (the operator can turn that off
 per flat); flats that already exist keep their providers.
 
 `default_private` (`local` or `tailscale`) and `default_public`
-(`tailscale-funnel`, `portal` or `zrok`) choose the one provider per mode that
+(`tailscale-funnel`, `portal`, `zrok` or `cloudflare-quick`) choose the one provider per mode that
 a new flat is allowed on when it is created, besides Local. Each must be in
 `permitted`; other permitted providers are not granted to new flats. An empty
 `default_private` follows `private_backend`, and an empty `default_public`
@@ -194,6 +197,12 @@ account already owns cannot be used; rename the flat. When the account's
 name limit is reached, the route reports the zrok controller's reason. The
 zrok client also honors its own `ZROK2_*` environment variables, such as
 `ZROK2_API_ENDPOINT` for a self-hosted zrok instance.
+
+`cloudflare-quick` has no settings and no credentials to enter: with it in
+`network.permitted`, each flat that allows it gets an anonymous Cloudflare
+quick tunnel while it is public. The tunnel credentials Flats keeps in
+`cloudflare-quick/` are deleted with the flat. `LIBTUNNEL_*` environment
+variables are ignored. See [Private and public access](networking.md#publishing-through-a-cloudflare-quick-tunnel).
 
 Parsing is strict: UTF-8, at most 1 MiB, no duplicate or unknown keys, no
 `null`, integers written as plain integers. One invalid value rejects the whole
@@ -302,7 +311,8 @@ written to the file.
 
 It refuses, writing nothing but the lock, when the directory already holds
 Flats data: a `flats.db` (convert a legacy one with `flats config migrate`),
-or any of `flats/`, `secret.key`, `tsnet/`, `portal/`, `zrok/`, `backups/`,
+or any of `flats/`, `secret.key`, `tsnet/`, `portal/`, `zrok/`,
+`zrok-environment/`, `cloudflare-quick/`, `backups/`,
 `network-retirements/` or `network-provider.json` without a database (restore
 the database and config from the same backup). Other entries, such as a new
 volume's `lost+found`, are fine. A bootstrap interrupted after writing

@@ -130,17 +130,17 @@ export function noticeFor(vis) {
 }
 
 // publicURL is the current public address: Portal's public_url, or the URL
-// of a current Tailscale Funnel or zrok route.
+// of a current Tailscale Funnel, zrok or Cloudflare quick tunnel route.
 export function publicURL(f) {
   if (!f) return '';
   if (f.public_url) return f.public_url;
   const ep = (f.endpoints || []).find((e) => e.audience === 'current' && e.url &&
-    (e.provider === 'tailscale-funnel' || e.provider === 'portal' || e.provider === 'zrok'));
+    (e.provider === 'tailscale-funnel' || e.provider === 'portal' || e.provider === 'zrok' || e.provider === 'cloudflare-quick'));
   return ep ? ep.url : '';
 }
 
-const NETWORK_LABELS = { local: 'Local', tailscale: 'Tailscale', 'tailscale-funnel': 'Tailscale Funnel', portal: 'Portal', zrok: 'zrok' };
-const PUBLIC_NETWORKS = ['tailscale-funnel', 'portal', 'zrok'];
+const NETWORK_LABELS = { local: 'Local', tailscale: 'Tailscale', 'tailscale-funnel': 'Tailscale Funnel', portal: 'Portal', zrok: 'zrok', 'cloudflare-quick': 'Cloudflare Quick Tunnel' };
+const PUBLIC_NETWORKS = ['tailscale-funnel', 'portal', 'zrok', 'cloudflare-quick'];
 
 // openTargets lists the addresses that open a flat's live version, one per
 // allowed network that has a route: private networks first, then public
