@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -54,6 +55,18 @@ func trustedAccess(r *http.Request, public bool) *http.Request {
 	return r
 }
 
+// docsAssetCSP keeps every bundle asset inert: no scripts (sandbox, no
+// script-src), no plugins, frames or connections, and an opaque origin. Inline
+// styles and same-site or data: images stay allowed so an SVG or image opened
+// directly still renders.
+const docsAssetCSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; sandbox"
+
+// docsMediaCSP is for audio and video. Browsers do not play a media file opened
+// directly in a sandboxed document, so it omits sandbox; with a fixed media type
+// and nosniff the browser's media document has nothing scriptable, and
+// default-src 'none' still forbids scripts.
+const docsMediaCSP = "default-src 'none'; media-src 'self'; frame-ancestors 'none'"
+
 func docsAssets(worker http.Handler, dir string, assets []string) http.Handler {
 	listed := make(map[string]bool, len(assets))
 	for _, p := range assets {
@@ -62,11 +75,84 @@ func docsAssets(worker http.Handler, dir string, assets []string) http.Handler {
 	static := &site.Static{Dir: dir}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && listed[r.URL.Path] {
+			// Bundle assets are untrusted, including assets saved before this policy.
+			// Never let an asset become an active document on the docs origin.
+			typ := docsInlineMIME(r.URL.Path)
+			if strings.HasPrefix(typ, "audio/") || strings.HasPrefix(typ, "video/") {
+				w.Header().Set("Content-Security-Policy", docsMediaCSP)
+			} else {
+				w.Header().Set("Content-Security-Policy", docsAssetCSP)
+			}
+			if typ != "" {
+				w.Header().Set("Content-Type", typ)
+			} else {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Disposition", "attachment")
+			}
 			static.ServeHTTP(w, r)
 			return
 		}
 		worker.ServeHTTP(w, r)
 	})
+}
+
+// docsInlineMIME returns a fixed MIME type for assets that may appear inline in
+// a document. Every other file must be downloaded instead. SVG stays inline so
+// Markdown images keep rendering: an <img> never runs SVG scripts, and the
+// asset CSP (no scripts, sandboxed) also covers opening the file directly.
+func docsInlineMIME(p string) string {
+	switch strings.ToLower(path.Ext(p)) {
+	case ".apng":
+		return "image/apng"
+	case ".avif":
+		return "image/avif"
+	case ".bmp":
+		return "image/bmp"
+	case ".gif":
+		return "image/gif"
+	case ".ico":
+		return "image/x-icon"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".svg":
+		return "image/svg+xml"
+	case ".tif", ".tiff":
+		return "image/tiff"
+	case ".webp":
+		return "image/webp"
+	case ".flac":
+		return "audio/flac"
+	case ".m4a":
+		return "audio/mp4"
+	case ".mp3":
+		return "audio/mpeg"
+	case ".oga", ".ogg":
+		return "audio/ogg"
+	case ".wav":
+		return "audio/wav"
+	case ".mov":
+		return "video/quicktime"
+	case ".mp4":
+		return "video/mp4"
+	case ".ogv":
+		return "video/ogg"
+	case ".webm":
+		return "video/webm"
+	case ".otf":
+		return "font/otf"
+	case ".ttf":
+		return "font/ttf"
+	case ".woff":
+		return "font/woff"
+	case ".woff2":
+		return "font/woff2"
+	case ".csv", ".log", ".txt":
+		return "text/plain; charset=utf-8"
+	default:
+		return ""
+	}
 }
 
 func (s *Service) docsRuntime(v store.Version, versionDir string) (string, []string, func(), error) {
