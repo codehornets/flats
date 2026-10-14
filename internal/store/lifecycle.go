@@ -182,11 +182,34 @@ func (s *Store) DeleteVersion(ctx context.Context, flat string, n int) error {
 	return err
 }
 
-// CountPublished returns how many published versions a flat has.
-func (s *Store) CountPublished(ctx context.Context, flat string) (int, error) {
-	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM versions WHERE flat=? AND published=1`, flat).Scan(&n)
-	return n, err
+// HasDeployment reports whether any version of a flat was ever deployed.
+// A saved version that was never deployed does not count: Published means
+// deployed at least once.
+func (s *Store) HasDeployment(ctx context.Context, flat string) (bool, error) {
+	var ok bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM deployments WHERE flat=?)`, flat).Scan(&ok)
+	return ok, err
+}
+
+// DeployedVersions returns the numbers of a flat's versions that were ever
+// deployed (made live by a publish, deploy or rollback). A version named only
+// as a deployment's previous one was live too: migrated histories can lack
+// the row that first deployed it.
+func (s *Store) DeployedVersions(ctx context.Context, flat string) (map[int]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT version FROM deployments WHERE flat=? UNION SELECT previous FROM deployments WHERE flat=? AND previous>0`, flat, flat)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int]bool{}
+	for rows.Next() {
+		var n int
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out[n] = true
+	}
+	return out, rows.Err()
 }
 
 // PutDraftRevision inserts an immutable draft snapshot.
@@ -226,7 +249,7 @@ func scanDraft(sc interface{ Scan(...any) error }) (Draft, error) {
 
 // GetDraft returns the current draft.
 func (s *Store) GetDraft(ctx context.Context, flat string) (Draft, error) {
-	d, err := scanDraft(s.db.QueryRowContext(ctx, `SELECT flat,revision,hash,base_version,CASE WHEN hash = (SELECT v.hash FROM versions v JOIN flats f ON f.slug=v.flat AND f.live_version=v.number WHERE f.slug=drafts.flat) THEN 0 ELSE 1 END,size,files,kind,manifest,git_sha,git_dirty,message,updated_at,created_at FROM drafts WHERE flat=?`, flat))
+	d, err := scanDraft(s.db.QueryRowContext(ctx, `SELECT flat,revision,hash,base_version,CASE WHEN hash = (SELECT v.hash FROM versions v WHERE v.flat=drafts.flat AND v.published=1 ORDER BY v.number DESC LIMIT 1) THEN 0 ELSE 1 END,size,files,kind,manifest,git_sha,git_dirty,message,updated_at,created_at FROM drafts WHERE flat=?`, flat))
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, fmt.Errorf("draft of %q: %w", flat, ErrNotFound)
 	}
@@ -388,6 +411,35 @@ func (s *Store) CommitPublished(ctx context.Context, v Version, previous int, ap
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO deployments(flat,version,previous,kind,at,approval_id) VALUES(?,?,?,'publish',?,?)`, v.Flat, v.Number, previous, unix(now), approval); err != nil {
 		return err
+	}
+	return tx.Commit()
+}
+
+// CommitVersion atomically inserts a newly saved version from a draft revision
+// without changing live_version or recording a deployment.
+func (s *Store) CommitVersion(ctx context.Context, v Version, revision int, approval string, data json.RawMessage, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO versions(flat,number,hash,size,files,kind,manifest,git_sha,git_dirty,message,created_at,screenshot,published) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)`, v.Flat, v.Number, v.Hash, v.Size, v.Files, v.Kind, string(v.Manifest), v.GitSHA, v.GitDirty, v.Message, unix(v.CreatedAt), v.Screenshot); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE drafts SET dirty=0,base_version=?,updated_at=? WHERE flat=? AND revision=? AND hash=?`, v.Number, unix(now), v.Flat, revision, v.Hash); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE flats SET updated_at=? WHERE slug=?`, unix(now), v.Flat); err != nil {
+		return err
+	}
+	if approval != "" {
+		res, err := tx.ExecContext(ctx, `UPDATE approvals SET result_data=? WHERE id=? AND status='applying'`, string(data), approval)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return errors.New("approval no longer applying")
+		}
 	}
 	return tx.Commit()
 }

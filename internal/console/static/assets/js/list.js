@@ -3,7 +3,7 @@
 import { h, clear, icon, timeEl, visibilityBadge } from './dom.js';
 import { api, thumbnail } from './api.js';
 import { menu, errorPanel, loading, busy, openLinks, openPrimary, openMenuItems } from './ui.js';
-import { publishDraft } from './actions.js';
+import { saveVersion, publishVersion, nextVersion } from './actions.js';
 import { shareDialog } from './share.js';
 import { describeApproval } from './approval.js';
 
@@ -105,17 +105,40 @@ export function mount(main, _params, ctx) {
     // A document has no versions or publishing: it runs once it is saved.
     const docs = f.type === 'docs';
     const draft = !docs && f.draft && f.draft.dirty;
+    const latest = f.latest_version || 0;
+    // Save makes the draft a new version; Publish puts a saved version live.
+    const unpublished = !docs && latest > 0 && !f.latest_deployed;
     const status = docs ? (f.running ? 'Running' : 'Not running')
-      : (f.live_version ? `Live v${f.live_version}` : 'Not published') + (f.live_version && draft ? ' · draft changes' : '');
+      : (f.live_version
+        ? `Live v${f.live_version}` + (unpublished ? ` · v${latest} saved, not published` : '')
+        : 'Not published' + (unpublished ? ` · v${latest} saved` : ''))
+        + (draft ? ' · unsaved draft changes' : '');
     const actions = h('div', { class: 'row-actions' });
-    if (!docs && (!f.live_version || draft)) {
-      const pub = h('button', {
-        type: 'button', class: 'btn btn-pill', text: 'Publish', disabled: !draft,
-        title: draft ? 'Publish the draft' : 'No draft saved yet',
-        'aria-label': `Publish ${f.name || f.slug}`,
+    const name = f.name || f.slug;
+    if (!docs && draft) {
+      const n = nextVersion(f);
+      const save = h('button', {
+        type: 'button', class: 'btn btn-pill btn-quiet', text: `Save as v${n}`,
+        title: `Save the draft as version ${n}. Nothing goes live.`,
+        'aria-label': `Save the draft of ${name} as version ${n}`,
       });
-      pub.addEventListener('click', () => busy(pub, async () => { if (await publishDraft(f)) load(); }));
+      save.addEventListener('click', () => busy(save, async () => { if (await saveVersion(f)) load(); }));
+      actions.appendChild(save);
+    } else if (unpublished) {
+      const pub = h('button', {
+        type: 'button', class: 'btn btn-pill', text: `Publish v${latest}`,
+        title: `Put saved version ${latest} live`,
+        'aria-label': `Publish version ${latest} of ${name}`,
+      });
+      pub.addEventListener('click', () => busy(pub, async () => { if (await publishVersion(f, latest)) load(); }));
       actions.appendChild(pub);
+    } else if (!docs && !f.live_version) {
+      const save = h('button', {
+        type: 'button', class: 'btn btn-pill btn-quiet', text: 'Save as v1', disabled: true,
+        title: 'No draft saved yet',
+        'aria-label': `Save the draft of ${name} as version 1`,
+      });
+      actions.appendChild(save);
     }
     // A document is open once it runs; a flat once a version is live.
     // Wide rows show both open shortcuts; narrow ones show one and move the
