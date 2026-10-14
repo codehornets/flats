@@ -177,7 +177,7 @@ func (s *Service) requestDeploy(ctx context.Context, slugName string, n int, via
 	if err != nil {
 		return DeployResult{}, err
 	}
-	if err := s.refuseDocs(ctx, f); err != nil {
+	if err := s.refuseUnversioned(ctx, f); err != nil {
 		return DeployResult{}, err
 	}
 	if n <= 0 {
@@ -211,7 +211,7 @@ func (s *Service) requestRollback(ctx context.Context, slugName string, to int, 
 	if err != nil {
 		return DeployResult{}, err
 	}
-	if err := s.refuseDocs(ctx, f); err != nil {
+	if err := s.refuseUnversioned(ctx, f); err != nil {
 		return DeployResult{}, err
 	}
 	if f.LiveVersion == 0 {
@@ -914,6 +914,7 @@ func (s *Service) applyVisibilityApproval(ctx context.Context, a store.Approval)
 			return ActionResult{}, s.rollbackPublicExposure(ctx, f, err)
 		}
 		s.Event(ctx, a.Flat, "info", "visibility", fmt.Sprintf("visibility %s -> %s", p.From, target), nil)
+		s.notifyDesign(a.Flat, 0, 0, nil) // an open canvas shows the new visibility
 		fv := s.view(ctx, next)
 		return ActionResult{Status: "done", Flat: &fv, Notice: fv.PublicNotice, Message: "visibility changed to " + string(target)}, nil
 	}
@@ -934,6 +935,7 @@ func (s *Service) applyVisibilityApproval(ctx context.Context, a store.Approval)
 		return ActionResult{Status: "done", Flat: &fv, Notice: "Visibility is Private, but its private route needs attention: " + err.Error(), Message: "visibility changed to private; private exposure needs attention"}, nil
 	}
 	s.Event(ctx, a.Flat, "info", "visibility", fmt.Sprintf("visibility %s -> private", p.From), nil)
+	s.notifyDesign(a.Flat, 0, 0, nil)
 	fv := s.view(ctx, f)
 	return ActionResult{Status: "done", Flat: &fv, Message: "visibility changed to private"}, nil
 }
@@ -1089,8 +1091,13 @@ func (s *Service) checkIsolated(ctx context.Context, f store.Flat, v store.Versi
 	if d.inst != nil {
 		d.inst.Stop()
 	}
+	if h.OK && contenttype.FromManifest(v.Manifest) == contenttype.Design {
+		return h, nil // the design shell is internal; its creation is logged as a design event
+	}
 	what := fmt.Sprintf("version %d", v.Number)
-	if contenttype.FromManifest(v.Manifest) == contenttype.Docs {
+	if contenttype.FromManifest(v.Manifest) == contenttype.Design {
+		what = "the design"
+	} else if contenttype.FromManifest(v.Manifest) == contenttype.Docs {
 		what = "the saved document" // a document has no versions or Draft
 	} else if !v.Published && v.Revision > 0 {
 		what = fmt.Sprintf("draft revision %d", v.Revision)
@@ -1168,7 +1175,9 @@ func (s *Service) saveDraftLocked(ctx context.Context, slugName string, files []
 		_ = s.st.UpdateFlat(ctx, f)
 	}
 	_ = s.st.Touch(ctx, slugName, now)
-	s.Event(ctx, slugName, "info", "draft", fmt.Sprintf("saved draft revision %d (%d files, %d bytes) via %s", next, res.Files, res.Size, via), map[string]any{"revision": next, "hash": res.Hash, "git_sha": meta.GitSHA})
+	if !meta.quiet {
+		s.Event(ctx, slugName, "info", "draft", fmt.Sprintf("saved draft revision %d (%d files, %d bytes) via %s", next, res.Files, res.Size, via), map[string]any{"revision": next, "hash": res.Hash, "git_sha": meta.GitSHA})
+	}
 	s.pruneDraftRevisions(ctx, slugName, next)
 	return versionFromRevision(rev), nil
 }
@@ -1440,7 +1449,7 @@ var ErrorCategories = []string{
 	"stale_approval", "public_stop_unconfirmed", "provider_not_permitted", "provider_unavailable",
 	"runtime_unavailable", "unavailable", "provider_in_use", "not_deployed", "unchanged_content",
 	"provider_not_ready", "config_overridden", "config_changed", "runtime_start_failed",
-	"health_check_failed", "edit_conflict", "document_capacity", "conflict", "forbidden", "not_docs", "document_not_found", "not_found", "invalid",
+	"health_check_failed", "edit_conflict", "document_capacity", "conflict", "forbidden", "not_docs", "not_design", "document_not_found", "not_found", "invalid",
 }
 
 // ErrorCategory defines cause precedence for persisted failures and transports.
@@ -1492,6 +1501,8 @@ func ErrorCategory(err error) string {
 		return "forbidden"
 	case errors.Is(err, ErrNotDocs):
 		return "not_docs"
+	case errors.Is(err, ErrNotDesign):
+		return "not_design"
 	case errors.Is(err, ErrDocumentNotFound):
 		return "document_not_found"
 	case errors.Is(err, store.ErrNotFound):
@@ -1508,7 +1519,7 @@ func (s *Service) GetDraft(ctx context.Context, flat string) (store.Draft, error
 	if err != nil {
 		return store.Draft{}, err
 	}
-	if err := s.refuseDocs(ctx, f); err != nil {
+	if err := s.refuseUnversioned(ctx, f); err != nil {
 		return store.Draft{}, err
 	}
 	return s.st.GetDraft(ctx, flat)
@@ -1523,7 +1534,7 @@ func (s *Service) Publish(ctx context.Context, flat string, revision int, hash s
 	if err != nil {
 		return ActionResult{}, err
 	}
-	if err := s.refuseDocs(ctx, f); err != nil {
+	if err := s.refuseUnversioned(ctx, f); err != nil {
 		return ActionResult{}, err
 	}
 	d, err := s.st.GetDraft(ctx, flat)
