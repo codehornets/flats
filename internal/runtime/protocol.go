@@ -31,7 +31,9 @@ const (
 	MaxResponseBody    = 32 << 20
 	MaxFileValue       = 10 << 20
 	MaxFilesTotal      = 1 << 30
+	MaxFilesObjects    = 20_000
 	MaxQueryResult     = 16 << 20
+	MaxDBBytes         = 1 << 30
 	MaxWSMessage       = 1 << 20
 	// maxLogLine is the longest log line the worker forwards. The host
 	// removes secret values from each complete line and only then truncates
