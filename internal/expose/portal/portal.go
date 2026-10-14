@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gosuda/portal-tunnel/v2/portal/identity"
@@ -98,14 +99,27 @@ type Net struct {
 	ctx    context.Context // parent of every exposure; cancelled by Close
 	cancel context.CancelFunc
 
-	mu           sync.RWMutex
-	closeOnce    sync.Once
-	closeErr     error
-	ops          sync.WaitGroup // admitted operations; Add is serialized with closing
-	shutdownErrs []error        // failures from completed teardown, including concurrent Stop
-	closed       bool
-	entries      map[string]*entry
-	locks        map[string]*sync.Mutex // per-slug Serve/Stop/SetHidden serialization
+	mu        sync.RWMutex
+	closeOnce sync.Once
+	closeErr  error
+	ops       sync.WaitGroup // admitted operations; Add is serialized with closing
+	closed    bool
+	entries   map[string]*entry
+	locks     map[string]*sync.Mutex // per-slug Serve/Stop/SetHidden serialization
+	leaseTTL  time.Duration          // tests shorten it; zero means sdkLeaseTTL
+}
+
+// sdkLeaseTTL is the lease lifetime the Portal SDK requests and renews
+// (portal-tunnel v2.6.3 sdk/listener.go defaultLeaseTTL). Once SDK Close has
+// returned, nothing renews the lease, so a relay that missed the unregister
+// request drops it within this time.
+const sdkLeaseTTL = 2 * time.Minute
+
+func (n *Net) leaseExpiry() time.Duration {
+	if n.leaseTTL > 0 {
+		return n.leaseTTL
+	}
+	return sdkLeaseTTL
 }
 
 var _ core.PublicNet = (*Net)(nil)
@@ -119,6 +133,16 @@ type entry struct {
 	httpErr error              // read only after done closes
 	done    chan struct{}      // closed when RunHTTP and the watcher returned
 
+	// The slug lock owns teardown state; e.mu guards stopping for status readers.
+	stopping    bool
+	closeResult <-chan closeResult // one SDK Close attempt, shared across retries
+	closeDone   bool
+	closeErr    error     // the first Close error; SDK Close uses sync.Once
+	closedAt    time.Time // when that Close returned
+	httpSeen    bool      // HTTP shutdown error already reported
+	pumpSeen    bool      // listener pump error already reported
+	stopErr     error     // latest unconfirmed teardown failure; guarded by Net.mu
+
 	mu      sync.Mutex
 	hidden  bool
 	pinned  string                     // discovered relay kept as explicit so the URL stays (see pin)
@@ -130,9 +154,13 @@ type entry struct {
 }
 
 type handlerBox struct {
-	mu sync.RWMutex
-	h  http.Handler
+	mu     sync.RWMutex
+	h      http.Handler
+	active atomic.Int64 // requests inside publicHandler
 }
+
+// idle reports whether no request is running. A nil box has none.
+func (b *handlerBox) idle() bool { return b == nil || b.active.Load() == 0 }
 
 func (b *handlerBox) get() http.Handler {
 	b.mu.RLock()
@@ -272,6 +300,19 @@ func (n *Net) Serve(ctx context.Context, slug string, h http.Handler, hidden boo
 		return "", errors.New("portal: closed")
 	}
 	if e != nil {
+		e.mu.Lock()
+		stopping := e.stopping
+		e.mu.Unlock()
+		if stopping {
+			// Never revive an exposure being torn down. Finish that teardown
+			// first; a confirmed one lets this Serve register afresh.
+			if err := n.finishStop(slug, e); err != nil {
+				return "", fmt.Errorf("portal: %s teardown not confirmed: %w", slug, err)
+			}
+			e = nil
+		}
+	}
+	if e != nil {
 		e.handler.set(h)
 		if err := n.setHidden(e, hidden); err != nil {
 			return "", err
@@ -333,9 +374,16 @@ func (n *Net) Serve(ctx context.Context, slug string, h http.Handler, hidden boo
 
 	n.mu.Lock()
 	if n.closed {
-		// Close ran while this exposure was being created and did not see it.
+		// Close already took its entry snapshot, but it still waits for
+		// this admitted Serve. Retain failed cleanup for later inspection.
+		e.mu.Lock()
+		e.stopping = true
+		e.mu.Unlock()
+		n.entries[slug] = e
 		n.mu.Unlock()
-		return "", errors.Join(errors.New("portal: closed"), n.stopEntry(e))
+		stopErr := n.stopEntry(e)
+		n.settleStop(slug, e, stopErr)
+		return "", errors.Join(errors.New("portal: closed"), stopErr)
 	}
 	n.entries[slug] = e
 	n.mu.Unlock()
@@ -346,6 +394,8 @@ func (n *Net) Serve(ctx context.Context, slug string, h http.Handler, hidden boo
 // path never carries a Tailscale identity.
 func publicHandler(b *handlerBox) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.active.Add(1)
+		defer b.active.Add(-1)
 		for k := range r.Header {
 			if strings.HasPrefix(k, "Tailscale-User-") {
 				r.Header.Del(k)
@@ -371,6 +421,12 @@ func (n *Net) SetHidden(slug string, hidden bool) error {
 	if e == nil {
 		return fmt.Errorf("portal: %s is not served", slug)
 	}
+	e.mu.Lock()
+	stopping := e.stopping
+	e.mu.Unlock()
+	if stopping {
+		return fmt.Errorf("portal: %s teardown not confirmed", slug)
+	}
 	return n.setHidden(e, hidden)
 }
 
@@ -394,12 +450,23 @@ func (n *Net) setHidden(e *entry, hidden bool) error {
 	return nil
 }
 
-// Stop shuts the HTTP server down, unregisters slug from its relays and
-// forgets its status. Unknown slugs are a no-op.
+// Stop shuts down HTTP and unregisters slug from its relays. It forgets the
+// exposure only after all teardown obligations succeed. Unknown slugs are
+// a no-op.
 func (n *Net) Stop(slug string) error {
 	if !n.beginOp() {
+		n.mu.RLock()
+		e := n.entries[slug]
+		var stopErr error
+		if e != nil {
+			stopErr = e.stopErr
+		}
+		n.mu.RUnlock()
+		if e != nil {
+			return errors.Join(fmt.Errorf("portal: %s teardown not confirmed: network closed", slug), stopErr)
+		}
 		return nil
-	} // Close owns remaining entries.
+	}
 	defer n.ops.Done()
 	return n.stop(slug)
 }
@@ -418,28 +485,44 @@ func (n *Net) stop(slug string) error {
 	l := n.slugLock(slug)
 	l.Lock()
 	defer l.Unlock()
-	n.mu.Lock()
+
+	n.mu.RLock()
 	e := n.entries[slug]
-	delete(n.entries, slug)
-	n.mu.Unlock()
+	n.mu.RUnlock()
 	if e == nil {
 		return nil
 	}
-	return n.stopEntry(e)
+	return n.finishStop(slug, e)
 }
 
-func (n *Net) stopEntry(e *entry) (retErr error) {
-	// A Stop may remove its entry before Close snapshots entries. Preserve
-	// its failure so Close cannot silently release host state after a timeout.
-	defer func() {
-		if retErr != nil {
-			n.mu.Lock()
-			n.shutdownErrs = append(n.shutdownErrs, retErr)
-			n.mu.Unlock()
-		}
-	}()
-	// A single deadline bounds all stages. Even if HTTP drain fails, attempt
-	// unregistering the exposure; an SDK Close that hangs is left to process exit.
+// finishStop tears e down, or resumes its pending teardown, and forgets it
+// once confirmed. The slug lock is held.
+func (n *Net) finishStop(slug string, e *entry) error {
+	e.mu.Lock()
+	e.stopping = true
+	e.mu.Unlock()
+
+	err := n.stopEntry(e)
+	n.settleStop(slug, e, err)
+	return err
+}
+
+// settleStop forgets a confirmed teardown or records why it is still
+// unconfirmed. Close reports the failures of entries that remain, so a later
+// retry that confirms teardown also clears an earlier failure.
+func (n *Net) settleStop(slug string, e *entry, err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if err == nil {
+		delete(n.entries, slug)
+		return
+	}
+	e.stopErr = err
+}
+
+// stopEntry holds the slug lock. It resumes pending work without issuing
+// another SDK Close: SDK v2 uses sync.Once and later calls lose the first error.
+func (n *Net) stopEntry(e *entry) error {
 	ctx, cancel := context.WithTimeout(context.Background(), n.cfg.ShutdownTimeout)
 	defer cancel()
 	var errs []error
@@ -452,27 +535,78 @@ func (n *Net) stopEntry(e *entry) (retErr error) {
 		}
 		return false
 	}
+
 	e.cancel()
-	if wait(e.done, "HTTP drain") && e.httpErr != nil && !errors.Is(e.httpErr, net.ErrClosed) && !errors.Is(e.httpErr, context.Canceled) {
-		errs = append(errs, fmt.Errorf("portal: %s HTTP shutdown: %w", e.slug, e.httpErr))
-	}
-	// Force the drain listener closed even if a stuck HTTP/watch path did
-	// not do so, allowing the pump to discard queued connections.
-	e.ln.Close()
-	closed := make(chan error, 1)
-	go func() { closed <- e.exp.Close() }()
-	select {
-	case err := <-closed:
-		if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) {
-			errs = append(errs, fmt.Errorf("portal: close %s: %w", e.slug, err))
+	if wait(e.done, "HTTP drain") {
+		switch err := e.httpErr; {
+		case errors.Is(err, context.DeadlineExceeded):
+			// sdk.RunHTTP gives up after its own shutdown timeout and returns
+			// while requests may still run. Those requests are the
+			// obligation, not the historical error: wait for them.
+			if !waitIdle(ctx, e.handler) {
+				errs = append(errs, fmt.Errorf("portal: %s HTTP drain: requests still running after %s: %w", e.slug, n.cfg.ShutdownTimeout, err))
+			}
+		case err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) && !e.httpSeen:
+			// A finished server leaves nothing to retry: report it once.
+			e.httpSeen = true
+			errs = append(errs, fmt.Errorf("portal: %s HTTP shutdown: %w", e.slug, err))
 		}
-	case <-ctx.Done():
-		errs = append(errs, fmt.Errorf("portal: %s exposure close exceeded %s: %w", e.slug, n.cfg.ShutdownTimeout, ctx.Err()))
 	}
-	if wait(e.ln.pumped, "listener pump") && e.ln.err != nil && !errors.Is(e.ln.err, net.ErrClosed) && !errors.Is(e.ln.err, context.Canceled) {
+	// Stop accepting even if HTTP drain timed out; the pump remains an
+	// obligation until the underlying exposure closes.
+	e.ln.Close()
+	if e.closeResult == nil {
+		closed := make(chan closeResult, 1)
+		e.closeResult = closed
+		go func() {
+			err := e.exp.Close()
+			closed <- closeResult{err: err, at: time.Now()}
+		}()
+	}
+	if !e.closeDone {
+		select {
+		case r := <-e.closeResult:
+			e.closeDone = true
+			e.closedAt = r.at
+			if err := r.err; err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) {
+				e.closeErr = fmt.Errorf("portal: close %s: %w", e.slug, err)
+			}
+		case <-ctx.Done():
+			errs = append(errs, fmt.Errorf("portal: %s exposure close exceeded %s: %w", e.slug, n.cfg.ShutdownTimeout, ctx.Err()))
+		}
+	}
+	// A failed unregister stays unconfirmed until the relay must have
+	// dropped the unrenewed lease; calling Close again would return nil.
+	if e.closeErr != nil {
+		if left := n.leaseExpiry() - time.Since(e.closedAt); left > 0 {
+			errs = append(errs, fmt.Errorf("%w (the relay drops the lease within %s)", e.closeErr, (left+time.Second-1).Truncate(time.Second)))
+		}
+	}
+	if wait(e.ln.pumped, "listener pump") && e.ln.err != nil && !errors.Is(e.ln.err, net.ErrClosed) && !errors.Is(e.ln.err, context.Canceled) && !e.pumpSeen {
+		e.pumpSeen = true // the pump has returned: report its error once
 		errs = append(errs, fmt.Errorf("portal: %s listener pump: %w", e.slug, e.ln.err))
 	}
 	return errors.Join(errs...)
+}
+
+// closeResult is the outcome of the one SDK Close call and when it returned.
+type closeResult struct {
+	err error
+	at  time.Time
+}
+
+// waitIdle waits until no request runs in b or ctx ends.
+func waitIdle(ctx context.Context, b *handlerBox) bool {
+	t := time.NewTicker(10 * time.Millisecond)
+	defer t.Stop()
+	for !b.idle() {
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			return b.idle()
+		}
+	}
+	return true
 }
 
 // Close stops every exposure. Later Serve calls fail.
@@ -493,7 +627,7 @@ func (n *Net) Close() error {
 		// The SDK closes an exposure on parent cancellation and discards the
 		// first Close error. Keep that parent alive until explicit teardown
 		// drains HTTP and captures unregister errors, including an admitted
-		// Stop that already removed its entry or a late Serve's cleanup.
+		// Stop with unconfirmed teardown or a late Serve's cleanup.
 		// On timeout cancellation unblocks context-aware SDK work; the caller
 		// receives a deadline error even if background cleanup outlives Close.
 		defer n.cancel()
@@ -502,13 +636,28 @@ func (n *Net) Close() error {
 		select {
 		case <-done:
 			n.mu.Lock()
-			n.closeErr = errors.Join(n.shutdownErrs...)
+			n.closeErr = n.unconfirmedErr()
 			n.mu.Unlock()
 		case <-time.After(n.cfg.ShutdownTimeout):
 			n.closeErr = fmt.Errorf("portal: network shutdown exceeded %s: %w", n.cfg.ShutdownTimeout, context.DeadlineExceeded)
 		}
 	})
 	return n.closeErr
+}
+
+// unconfirmedErr joins the failures of exposures whose teardown is still
+// unconfirmed, in slug order. n.mu is held.
+func (n *Net) unconfirmedErr() error {
+	var errs []error
+	for _, slug := range slices.Sorted(maps.Keys(n.entries)) {
+		e := n.entries[slug]
+		if err := e.stopErr; err != nil {
+			errs = append(errs, err)
+		} else {
+			errs = append(errs, fmt.Errorf("portal: %s teardown not confirmed", slug))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (n *Net) entry(slug string) *entry {
@@ -965,6 +1114,7 @@ func (n *Net) hostInfo(e *entry) (core.HostInfo, bool) {
 	live := e.exp.Relays()
 	e.mu.Lock()
 	hidden := e.hidden
+	stopping := e.stopping
 	merged := maps.Clone(e.sticky)
 	var lost []string
 	for _, s := range live {
@@ -1029,6 +1179,10 @@ func (n *Net) hostInfo(e *entry) (core.HostInfo, bool) {
 	}
 	if hidden {
 		parts = append(parts, "unlisted")
+	}
+	if stopping {
+		hi.State = "error"
+		parts = append(parts, "teardown pending confirmation")
 	}
 	hi.Detail = strings.Join(parts, "; ")
 	return hi, conflict
