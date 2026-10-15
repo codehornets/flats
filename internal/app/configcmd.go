@@ -28,7 +28,7 @@ func (e *UsageError) ExitCode() int { return 2 }
 func usagef(format string, args ...any) error { return &UsageError{fmt.Sprintf(format, args...)} }
 
 // ConfigUsage lists the `flats config` subcommands.
-const ConfigUsage = `config init [--data dir] [--config path] [--listen addr] [--local-addr addr] [--console-host name] [--runtime=bool]
+const ConfigUsage = `config init [--data dir] [--config path] [--listen addr] [--local-addr addr] [--runtime=bool]
        flats config show [--config path | --data dir]
        flats config validate [--config path | --data dir]
        flats config set KEY VALUE [--config path | --data dir]
@@ -167,10 +167,15 @@ func (c *configCmd) init(args []string) error {
 	}
 	f.StringVar(host["listen"], "listen", "", "loopback management address")
 	f.StringVar(host["local-addr"], "local-addr", "", "address of the local network")
-	f.StringVar(host["console-host"], "console-host", "", "tailnet host name of the console")
+	f.StringVar(host["console-host"], "console-host", "", "removed: add console domains with `flats config set tailscale.console_hosts`")
 	serverRuntime := f.Bool("runtime", true, "enable server flats")
 	if err := c.parseFlags(args); err != nil {
 		return err
+	}
+	removed := false
+	f.Visit(func(fl *flag.Flag) { removed = removed || fl.Name == "console-host" })
+	if removed {
+		return usagef("--console-host was removed: after init, permit Tailscale (`flats config set network.permitted tailscale`) and add console domains with `flats config set tailscale.console_hosts NAME`")
 	}
 	values := map[string]string{}
 	f.Visit(func(fl *flag.Flag) {
@@ -576,6 +581,13 @@ func EnsureConfig(ctx context.Context, configPath, dataDir string, serveArgs []s
 	if o.Set["config"] {
 		return "", "", usagef("pass --config to install, not as a serve flag")
 	}
+	// The service runs from config.json alone; a zrok or NetBird key given
+	// only as a flag would be lost, so it goes to flats.db first.
+	for _, f := range []struct{ flag, id string }{{"zrok-token-file", "zrok"}, {"netbird-setup-key-file", "netbird"}} {
+		if o.Set[f.flag] {
+			return "", "", usagef("--%s is not kept by install: store the key with `flats key set %s --from-file PATH` before or after installing", f.flag, f.id)
+		}
+	}
 	c := &configCmd{configFlag: configPath, dataFlag: dataDir}
 	if o.Set["data"] {
 		if dataDir != "" && o.DataDir != mustAbs(dataDir) {
@@ -585,6 +597,16 @@ func EnsureConfig(ctx context.Context, configPath, dataDir string, serveArgs []s
 	}
 	if configPath, dataDir, err = c.paths(); err != nil {
 		return "", "", err
+	}
+	// Only a migration records a Tailscale key file path; for a host that
+	// has its config already, the installed service would lose the flag.
+	for _, flag := range []string{"tailscale-authkey-file", "authkey-file"} {
+		if !o.Set[flag] {
+			continue
+		}
+		if _, err := os.Stat(configPath); err == nil {
+			return "", "", usagef("--%s is not kept by install for a host that already has %s: stop the host and store the key with `flats key set tailscale --from-file PATH`, or register it in the console", flag, configPath)
+		}
 	}
 	// A configured, bound host whose flags match needs no lock: the service
 	// may be running and keeps running until install restarts it.

@@ -25,7 +25,7 @@ func TestConfigShowValidateSetUnset(t *testing.T) {
 	dir := t.TempDir()
 	path := initConfig(t, dir)
 	out, err := runConfig(t, "show", "--config", path)
-	if err != nil || !strings.Contains(out, `"schema_version": 1`) || !strings.Contains(out, `system.keep_versions               10 (default)`) ||
+	if err != nil || !strings.Contains(out, `"schema_version": 2`) || !strings.Contains(out, `system.keep_versions               10 (default)`) ||
 		!strings.Contains(out, `host.data_dir                      "`+dir+`" (file)`) {
 		t.Fatalf("show: %v\n%s", err, out)
 	}
@@ -207,6 +207,30 @@ func TestEnsureConfigForInstall(t *testing.T) {
 	// Different flags are refused.
 	if _, _, err := EnsureConfig(ctx, "", dir, []string{"--permit", "portal"}, &out); exitCode(err) != ExitConfig {
 		t.Fatalf("different flags: %v", err)
+	}
+	// Key flags the installed service would lose are refused, with the way to
+	// store the key instead.
+	for _, args := range [][]string{{"--tailscale-authkey-file", "/k"}, {"--authkey-file", "/k"}, {"--zrok-token-file", "/k"}, {"--netbird-setup-key-file", "/k"}} {
+		if _, _, err := EnsureConfig(ctx, "", dir, args, &out); exitCode(err) != 2 || !strings.Contains(err.Error(), "flats key set") {
+			t.Errorf("%q on an existing host: %v", args, err)
+		}
+	}
+	// A new host stores the key of a Tailscale key file in flats.db; the
+	// config holds no key and no path.
+	fresh := filepath.Join(t.TempDir(), "data")
+	if _, _, err := EnsureConfig(ctx, "", fresh, []string{"--tailscale-authkey-file", writeKey(t, keyB)}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(fresh, "config.json")); strings.Contains(string(raw), "tailscale_authkey_file") {
+		t.Fatalf("config.json = %s", raw)
+	}
+	if got := storedTailscaleKey(t, fresh); got != keyB {
+		t.Fatalf("stored key = %q", got)
+	}
+	// An unreadable key file stops the install before anything is written.
+	broken := filepath.Join(t.TempDir(), "data")
+	if _, _, err := EnsureConfig(ctx, "", broken, []string{"--authkey-file", filepath.Join(t.TempDir(), "missing")}, &out); exitCode(err) != ExitConfig {
+		t.Fatalf("unreadable key file: %v", err)
 	}
 	// A legacy data directory is migrated, to a config path of choice.
 	legacy := legacyDir(t)

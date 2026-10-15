@@ -149,12 +149,12 @@ func TestLegacyUpgradeEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	instance := h.Config.Host.InstanceID
+	// --console-host named a tailnet console only with --network tailscale.
 	want := `{
-  "schema_version": 1,
+  "schema_version": 2,
   "host": {
     "instance_id": "` + instance + `",
-    "data_dir": "` + dir + `",
-    "console_host": "console"
+    "data_dir": "` + dir + `"
   },
   "network": {
     "permitted": ["portal"],
@@ -314,7 +314,8 @@ func TestLegacyUpgradeResumesAfterInterruption(t *testing.T) {
 			t.Fatal("wrote past the interruption")
 		}
 		h := resume(t, dir, flags...)
-		if !slices.Equal(h.Config.Network.Permitted, []string{"portal"}) || h.Config.Host.ConsoleHost != "resumed" {
+		// --console-host named a tailnet console only with --network tailscale.
+		if !slices.Equal(h.Config.Network.Permitted, []string{"portal"}) || len(h.Config.Tailscale.ConsoleHosts) != 0 {
 			t.Fatalf("config = %+v %+v", h.Config.Host, h.Config.Network)
 		}
 	})
@@ -331,8 +332,8 @@ func TestLegacyUpgradeResumesAfterInterruption(t *testing.T) {
 		written, _ := l.Doc.Effective(nil)
 		// A different flag cannot finish the migration with this config.
 		interrupt = nil
-		_, err = Start(context.Background(), legacyFlags(t, dir, "--network", "local"))
-		if exitCode(err) != ExitConfig || !strings.Contains(err.Error(), `- "console_host": "resumed"`) {
+		_, err = Start(context.Background(), legacyFlags(t, dir, "--network", "local", "--console-host", "resumed", "--runtime=false"))
+		if exitCode(err) != ExitConfig || !strings.Contains(err.Error(), `"server_runtime": false`) {
 			t.Fatalf("resume with other flags: %v", err)
 		}
 		if readBinding(t, dir) != nil {
@@ -500,7 +501,7 @@ func TestConfigModeRefusals(t *testing.T) {
 		dir := t.TempDir()
 		path := initConfig(t, dir)
 		raw, _ := os.ReadFile(path)
-		raw = bytes.Replace(raw, []byte(`"schema_version": 1`), []byte(`"schema_version": 2`), 1)
+		raw = bytes.Replace(raw, []byte(`"schema_version": 2`), []byte(`"schema_version": 3`), 1)
 		if err := os.WriteFile(path, raw, 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -521,8 +522,17 @@ func TestConfigModeRefusals(t *testing.T) {
 			name, _, _ := strings.Cut(flags[0], "=")
 			refused(t, o, name)
 		}
-		// The four host flags override the file for one run.
-		o, err := ParseServeFlags([]string{"--config", path, "--listen", "127.0.0.1:0", "--local-addr", "127.0.0.1:0", "--console-host", "gate", "--runtime=false"})
+		// --console-host overrides the console domains for one run, which
+		// needs Tailscale permitted; this file does not permit it.
+		o, err := ParseServeFlags([]string{"--config", path, "--listen", "127.0.0.1:0", "--local-addr", "127.0.0.1:0", "--console-host", "gate"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Start(ctx, o); exitCode(err) != ExitConfig || !strings.Contains(err.Error(), "tailscale.console_hosts") {
+			t.Fatalf("--console-host without tailscale: %v", err)
+		}
+		// The host flags override the file for one run.
+		o, err = ParseServeFlags([]string{"--config", path, "--listen", "127.0.0.1:0", "--local-addr", "127.0.0.1:0", "--runtime=false"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -531,7 +541,7 @@ func TestConfigModeRefusals(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer h.Close()
-		if h.Config.Host.ConsoleHost != "gate" || h.Config.Host.ServerRuntime {
+		if h.Config.Host.ServerRuntime {
 			t.Fatalf("host = %+v", h.Config.Host)
 		}
 		if raw, _ := os.ReadFile(path); bytes.Contains(raw, []byte("gate")) {
@@ -648,18 +658,21 @@ func mustRead(t *testing.T, path string) []byte {
 
 func TestConfigInitIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	path := initConfig(t, dir, "--console-host", "console")
+	path := initConfig(t, dir, "--listen", "127.0.0.1:7999")
 	first := hashFile(t, path)
 	b := readBinding(t, dir)
 	var out bytes.Buffer
-	if err := ConfigCommand(context.Background(), []string{"init", "--data", dir, "--console-host", "console"}, &out); err != nil || !strings.Contains(out.String(), "already initialized") {
+	if err := ConfigCommand(context.Background(), []string{"init", "--data", dir, "--listen", "127.0.0.1:7999"}, &out); err != nil || !strings.Contains(out.String(), "already initialized") {
 		t.Fatalf("second init: %v %s", err, out.String())
 	}
 	if hashFile(t, path) != first || *readBinding(t, dir) != *b {
 		t.Fatal("second init changed the host")
 	}
-	if err := ConfigCommand(context.Background(), []string{"init", "--data", dir, "--console-host", "other"}, &out); exitCode(err) != ExitConfig {
+	if err := ConfigCommand(context.Background(), []string{"init", "--data", dir, "--listen", "127.0.0.1:7998"}, &out); exitCode(err) != ExitConfig {
 		t.Fatalf("init with other flags: %v", err)
+	}
+	if err := ConfigCommand(context.Background(), []string{"init", "--data", t.TempDir(), "--console-host", "x"}, &out); exitCode(err) != 2 {
+		t.Fatalf("init --console-host: %v", err)
 	}
 	// Init refuses a data directory that already holds a host.
 	legacy := legacyDir(t)
@@ -698,7 +711,7 @@ func TestConfigInitIsIdempotent(t *testing.T) {
 // host from its flags, as the tailnet gate script does.
 func TestLegacyFreshStartInitializes(t *testing.T) {
 	dir := t.TempDir()
-	key := filepath.Join(t.TempDir(), "authkey")
+	key := writeKey(t, keyA)
 	o := legacyFlags(t, dir, "--listen", "127.0.0.1:27999", "--console-host", "gate-x", "--portal=false", "--authkey-file", key, "--permit", "portal")
 	o.Overrides = map[string]string{"host.management_addr": "127.0.0.1:0", "host.local_addr": "127.0.0.1:0"}
 	// Stop before networking: only the config is under test here.
@@ -717,9 +730,13 @@ func TestLegacyFreshStartInitializes(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, _ := l.Doc.Effective(nil)
-	if c.Host.ManagementAddr != "127.0.0.1:27999" || c.Host.ConsoleHost != "gate-x" || len(c.Network.Permitted) != 0 ||
-		c.Credentials.TailscaleAuthKeyFile != key || c.Host.DataDir != dir {
+	if c.Host.ManagementAddr != "127.0.0.1:27999" || len(c.Tailscale.ConsoleHosts) != 0 || len(c.Network.Permitted) != 0 ||
+		c.Credentials.TailscaleAuthKeyFile != "" || c.Host.DataDir != dir {
 		t.Fatalf("config = %+v %+v %+v", c.Host, c.Network, c.Credentials)
+	}
+	// The key of --authkey-file is in flats.db, not its path in config.json.
+	if got := storedTailscaleKey(t, dir); got != keyA {
+		t.Fatalf("stored key = %q", got)
 	}
 	if b := readBinding(t, dir); b == nil || b.MigratedAt != nil {
 		t.Fatalf("binding = %+v", b)
@@ -736,7 +753,7 @@ func TestSettingsSaveToConfigAndDetectEdits(t *testing.T) {
 	if !bytes.Contains(raw, []byte(`"keep_versions": 3`)) || !bytes.Contains(raw, []byte(`"relays": ["https://relay.example.com"]`)) {
 		t.Fatalf("config.json =\n%s", raw)
 	}
-	if hist, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "config-history", "config.v1.*.json")); len(hist) != 1 {
+	if hist, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "config-history", "config.v2.*.json")); len(hist) != 1 {
 		t.Fatalf("history = %q", hist)
 	}
 	if h.Svc.UploadLimit() != 20<<20 {
