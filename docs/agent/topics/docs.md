@@ -10,7 +10,7 @@ approval, and its Private URL serves it as soon as the host is ready. Its
 history is kept as **revisions** instead (below).
 Visibility still works as for websites: making it Public (or Private again)
 and deleting it wait for the operator's approval (`topic.approvals`). On
-documents, `list_versions`, `get_draft`, `publish`, `deploy`, `open_preview`
+documents, `list_versions`, `get_draft`, `create_version`, `deploy`, `open_preview`
 and `rollback` are refused (`refusal.invalid`).
 
 ### Create and write
@@ -31,10 +31,13 @@ and `rollback` are refused (`refusal.invalid`).
    are merged as described below. The result names the saved `doc` and the
    `entry`; `get_document` without `doc` reads the entry, which may differ
    from the default save path `index.md`. The result's `flat` shows `running`.
-4. To deliberately replace the **whole bundle**, use `save_version` with
-   every document and asset to keep and a `flats.json` of `{"type":"docs"}`.
-   Files omitted from that call are deleted. A docs bundle is not a Draft:
-   it runs at once.
+4. For several documents or assets, use `save_document {slug, replace_bundle: true,
+   files: [{path, content, encoding}]}` with the complete bundle, including
+   `flats.json` with `{"type":"docs"}`. This explicitly replaces the whole
+   bundle: omitted documents and assets are deleted. It runs at once.
+   The CLI equivalent is `flats save-document <slug> <dir|archive>`; the HTTP
+   archive route is `POST /api/flats/{slug}/document`. Both replace the whole
+   bundle explicitly. Draft tools and routes refuse document content.
 5. A slug keeps its type: saving a document into a website or a page, or
    either into a document, is refused (`refusal.conflict`); use another slug.
 

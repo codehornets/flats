@@ -11,7 +11,7 @@ const all = (root, pred) => [root, ...(root.childNodes || []).flatMap((n) => all
 const element = (root, tag, text) => all(root, (n) => n.tagName === tag && n.textContent === text)[0];
 const calls = [];
 let flat, views = 0;
-const values = { upload_max_bytes: '20971520', keep_versions: '10', disk_quota_bytes: '32212254720', preview_ttl_seconds: '86400', rate_limit_rps: '50', redirect_days: '7', events_keep: '5000', revision_quota: '20', pin_quota: '5' };
+const values = { upload_max_bytes: '20971520', version_quota: '20', disk_quota_bytes: '32212254720', preview_ttl_seconds: '86400', rate_limit_rps: '50', redirect_days: '7', events_keep: '5000', revision_quota: '20', pin_quota: '5' };
 globalThis.fetch = async (url, opts = {}) => {
   calls.push([url, opts]);
   let body;
@@ -54,6 +54,10 @@ assert.ok(element(main, 'LABEL', 'Pinned revisions allowed'));
 assert.ok(main.textContent.includes('each document or design keeps'));
 assert.ok(main.textContent.includes('Maximum pinned revisions per document or design'));
 assert.ok(main.textContent.includes('For websites and pages.'));
+assert.ok(element(main, 'LABEL', 'Version quota'));
+assert.equal(element(main, 'LABEL', 'Versions to keep'), undefined);
+assert.ok(main.textContent.includes('Versions are never deleted automatically'));
+assert.ok(main.textContent.includes('0 is unlimited.'));
 const input = (id) => all(main, (n) => n.getAttribute?.('id') === id)[0];
 const form = all(main, (n) => n.tagName === 'FORM' && n.className === 'settings-form')[0];
 input('set-pin_quota').value = '-1';

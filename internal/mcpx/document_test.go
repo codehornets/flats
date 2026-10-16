@@ -73,7 +73,7 @@ func TestDocumentTools(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			slug := "doc-" + name
 			for i, path := range []string{"", "notes/chapter.markdown"} {
-				var saved SaveOut
+				var saved saveFixtureOut
 				text, failed := call(t, client, "save_document", map[string]any{"slug": slug, "markdown": "# Hello\n한글 😀", "title": "Title", "path": path, "message": "edit"}, &saved)
 				if failed || saved.Flat == nil || saved.Flat.Type != "docs" || !saved.Flat.Running || saved.Flat.Visibility != "private" || saved.Flat.LiveVersion != 0 || saved.Flat.Publication != "" || saved.Flat.Draft != nil || saved.Draft.Revision != 0 || saved.Deploy != nil || !strings.Contains(text, "running now") {
 					t.Fatalf("save %d: %s %+v", i, text, saved)
@@ -100,7 +100,7 @@ func TestDocumentTools(t *testing.T) {
 				for _, tool := range []struct {
 					name string
 					args map[string]any
-				}{{"list_versions", nil}, {"get_draft", nil}, {"publish", nil}, {"deploy", map[string]any{"version": 0}}, {"rollback", nil}, {"open_preview", map[string]any{"version": 0}}} {
+				}{{"list_versions", nil}, {"get_draft", nil}, {"create_version", nil}, {"deploy", map[string]any{"version": 0}}, {"rollback", nil}, {"open_preview", map[string]any{"version": 0}}} {
 					args := map[string]any{"slug": slug}
 					for k, v := range tool.args {
 						args[k] = v
@@ -172,16 +172,16 @@ func TestContentTypesDiscovery(t *testing.T) {
 					t.Fatal("reference tool mutates")
 				}
 			}
-			// All complete-bundle entry points must disclose destructive omission
-			// semantics to agents; the single-document tool preserves siblings.
-			for _, tool := range []string{"save_version", "save_draft", "save_version_from_dir"} {
+			// Draft replacement must disclose omissions without advertising docs
+			// activation. Only explicit save_document bundles activate docs.
+			for _, tool := range []string{"save_draft", "save_draft_from_dir"} {
 				description := descriptions[tool]
-				if !strings.Contains(description, "complete") || !strings.Contains(description, "replac") || !strings.Contains(description, "delet") || !(strings.Contains(description, "omitted") || strings.Contains(description, "omissions")) || !strings.Contains(description, "docs") || !(strings.Contains(description, "runs at once") || strings.Contains(description, "run at once")) {
-					t.Errorf("%s must disclose complete replacement, deletion of omitted files and immediate docs activation: %s", tool, description)
+				if !strings.Contains(description, "complete") || !strings.Contains(description, "replac") || !strings.Contains(description, "delet") || !strings.Contains(description, "omitted") || !strings.Contains(description, "documents must use save_document") {
+					t.Errorf("%s must disclose complete Draft replacement, deletion of omissions and explicit docs route: %s", tool, description)
 				}
 			}
-			if description := descriptions["save_document"]; !strings.Contains(description, "preserving other documents") {
-				t.Errorf("single-document preservation guidance missing: %s", description)
+			if description := descriptions["save_document"]; !strings.Contains(description, "preserving other documents") || !strings.Contains(description, "replace_bundle=true") || !strings.Contains(description, "omitted files are deleted") || !strings.Contains(description, "runs at once") {
+				t.Errorf("single-document preservation and explicit live bundle replacement guidance missing: %s", description)
 			}
 
 		})

@@ -53,7 +53,25 @@ type registry struct {
 var migrations = registry{current: CurrentSchemaVersion, steps: []Migration{
 	{From: 1, To: 2, Apply: consoleHostsV2},
 	{From: 2, To: 3, Apply: netbirdPeersV3},
+	{From: 3, To: 4, Apply: versionQuotaV4},
 }}
+
+// versionQuotaV4 preserves only explicitly configured retention values.
+// An absent old setting adopts the new quota default of 20.
+func versionQuotaV4(doc map[string]any) error {
+	sys, ok := doc["system"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if old, ok := sys["keep_versions"]; ok {
+		if _, exists := sys["version_quota"]; exists {
+			return fmt.Errorf("config: system.keep_versions and system.version_quota cannot both be set")
+		}
+		sys["version_quota"] = old
+		delete(sys, "keep_versions")
+	}
+	return nil
+}
 
 // netbirdPeersV3 drops netbird.device_name: every flat and console domain now
 // runs its own NetBird peer named after it. Nothing else changes, so the

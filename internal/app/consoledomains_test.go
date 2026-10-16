@@ -689,7 +689,7 @@ func TestNetbirdConsoleAcceptsHTTPChanges(t *testing.T) {
 	tsHandler := tail.served["flats"]
 	tail.mu.Unlock()
 	try := func(handler http.Handler, host, origin, site string) int {
-		req := httptest.NewRequest("PUT", "http://"+host+"/console/api/settings", strings.NewReader(`{"keep_versions":"4"}`))
+		req := httptest.NewRequest("PUT", "http://"+host+"/console/api/settings", strings.NewReader(`{"version_quota":"4"}`))
 		req.Host = host
 		req.RemoteAddr = "127.0.0.1:5555"
 		req.Header.Set("X-Flats-Console", "1")

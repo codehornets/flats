@@ -271,6 +271,43 @@ func TestSaveDocumentRefusalsPreserveSource(t *testing.T) {
 	}
 }
 
+func TestSaveDocumentDiskQuotaGuidance(t *testing.T) {
+	s, _ := newTestService(t)
+	s.cfg.Runtime, s.cfg.DocsApp = &contentRuntime{}, testDocsApp()
+	ctx := t.Context()
+	if _, err := s.SaveDocument(ctx, "quota-guidance", "index.md", "saved", "", SaveMeta{}, ViaMCP); err != nil {
+		t.Fatal(err)
+	}
+	before, err := s.st.GetDraft(ctx, "quota-guidance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateSettings(ctx, map[string]string{SetDiskQuotaBytes: "1"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"single-document", "complete-bundle"} {
+		t.Run(mode, func(t *testing.T) {
+			if mode == "single-document" {
+				_, err = s.SaveDocument(ctx, "quota-guidance", "index.md", "replacement", "", SaveMeta{}, ViaMCP)
+			} else {
+				_, err = s.SaveVersion(ctx, "quota-guidance", []bundle.File{{Path: "flats.json", Data: []byte(`{"type":"docs"}`)}, {Path: "index.md", Data: []byte("replacement")}}, SaveMeta{}, ViaMCP)
+			}
+			validation, ok := bundle.IsValidation(err)
+			if !ok || len(validation.Problems) != 1 || !strings.Contains(validation.Problems[0].Message, "disk quota") {
+				t.Fatalf("disk quota must remain a structured upload validation refusal: %T %v", err, err)
+			}
+			fix := validation.Problems[0].Fix
+			if fix != "raise the per-flat disk quota in system settings to provide room for this save" {
+				t.Fatalf("already-over-quota refusal must offer a usable remedy: %s", fix)
+			}
+			after, err := s.st.GetDraft(ctx, "quota-guidance")
+			if err != nil || after.Hash != before.Hash || after.Revision != before.Revision {
+				t.Fatalf("quota refusal changed saved source: %+v %v", after, err)
+			}
+		})
+	}
+}
+
 func TestSaveDocumentCanShrinkOverLimitSource(t *testing.T) {
 	t.Parallel()
 	t.Run("lowered upload limit", func(t *testing.T) {
