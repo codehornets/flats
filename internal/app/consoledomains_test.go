@@ -27,10 +27,11 @@ type fakeTailnet struct {
 	stopErr  map[string]error
 	serveErr error
 	onStop   map[string]func() // what stopping a node closes
+	states   map[string]string // reported state of a served node; "" is ready
 }
 
 func newFakeTailnet() *fakeTailnet {
-	return &fakeTailnet{suffix: "tail1234.ts.net", served: map[string]http.Handler{}, stopErr: map[string]error{}}
+	return &fakeTailnet{suffix: "tail1234.ts.net", served: map[string]http.Handler{}, stopErr: map[string]error{}, states: map[string]string{}}
 }
 
 func (n *fakeTailnet) Serve(_ context.Context, host string, h http.Handler, _ bool) (string, error) {
@@ -68,7 +69,11 @@ func (n *fakeTailnet) Status() core.NetStatus {
 	defer n.mu.Unlock()
 	var st core.NetStatus
 	for h := range n.served {
-		st.Hosts = append(st.Hosts, core.HostInfo{Host: h, URL: "https://" + h + "." + n.suffix, State: "ready"})
+		state := "ready"
+		if st := n.states[h]; st != "" {
+			state = st
+		}
+		st.Hosts = append(st.Hosts, core.HostInfo{Host: h, URL: "https://" + h + "." + n.suffix, State: state})
 	}
 	return st
 }
