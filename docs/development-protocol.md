@@ -94,6 +94,10 @@ membership and content hashes before and after review. Drift makes review
 incomplete; establish a new stable snapshot and obtain review before claiming a
 current approval. No commit or publication is needed just to review a snapshot.
 
+The [review evidence helper](../internal/devreview/README.md) implements these
+rules, and [flats-review-evidence](../.agents/skills/flats-review-evidence/SKILL.md)
+says when and how to use it. It records evidence; it does not approve a stage.
+
 The executing agent maintains a concise task report outside committed source,
 links it in the user-visible handoff, and links or provides an accessible copy in
 a PR body when published. A local-only link is explicitly labeled as such; it is
