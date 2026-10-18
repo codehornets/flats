@@ -19,6 +19,11 @@ decide approvals, and why, is in [Approvals](design.md#approvals).
 
 Every request to the management server must name it in `Host`, and any
 `Origin` must be one of those names (see [Approvals](design.md#approvals)).
+The management listener also accepts operator-declared
+[`console.external_origins`](configuration.md#external-origins-behind-a-reverse-proxy).
+For these requests, any Origin must match the declared scheme and the request
+hostname/effective port exactly; even another declared origin is refused.
+Forwarded headers do not influence admission or link generation.
 On top of that:
 
 - **`/api`** refuses browser requests with `Sec-Fetch-Site: cross-site` or
@@ -38,8 +43,8 @@ On top of that:
   `same-site`, or an `Origin` other than the requested host, is 403. A
   scraper sends neither header and needs no credential. It is never served on
   a flat's route, a preview or a public provider.
-- **NetBird console domains** are plain HTTP, where browsers send no Fetch
-  Metadata. Only their handler marks requests as plain-HTTP console requests;
+- **NetBird console domains and declared HTTP external origins** are plain HTTP, where browsers send no Fetch
+  Metadata. Only their handlers mark requests as plain-HTTP console requests;
   on those, a mutation without `Sec-Fetch-Site` is accepted when `Origin` is
   present, uses `http`, and matches the requested host and port (a missing port
   is 80). A present `Sec-Fetch-Site` must still be `same-origin`. The custom
@@ -318,10 +323,16 @@ once saved.
   Turn on / Turn off, its key (Tailscale auth key, NetBird setup key, zrok
   account token: state and source, never the value), its hosts, its own
   settings and the flats that allow it. Console: the console's addresses on
-  every network, the address for links and the read-only host values. Limits:
+  every network, the address for links, external reverse-proxy origins and the
+  read-only host values. Limits:
   storage, history and traffic. Agents: MCP setup and what the agent tools
-  cannot do (the console itself is not authenticated yet). Fields stage changes for one save bar per page, which counts them, blocks
-  saving while one is invalid and asks again before a save that removes data;
+  cannot do (the console itself is not authenticated yet). Fields stage changes.
+  Console has separate inline Save/Discard controls for Links and Reverse proxy,
+  always visible and disabled until that section changes; saving one preserves
+  edits in the other. Other settings pages use one floating save bar. Each
+  form counts its changes, blocks invalid values and asks again before a save
+  that removes data. Removing the external origin currently in use also asks
+  for confirmation because that address stops accepting new requests;
   buttons act at once. A disabled action shows its reason next to it or on
   hover and keyboard focus.
 - **Approvals.** A top-bar item with the number of pending requests opens the
@@ -372,7 +383,8 @@ listener, or a domain being deleted) they use the preferred console,
 `console.preferred_host`, once its node is ready, else the first served Tailscale
 domain, then the first served NetBird domain, then the loopback address
 ([Preferred console](configuration.md#preferred-console)). Unset, the
-preference changes nothing. The Host header never changes a link. MCP
+preference changes nothing. A Host matching an operator-declared external origin
+uses that origin and scheme; any other Host never selects an external link. MCP
 requests carry the same context, so an agent's approval links use the domain
 it connected to. `console_urls` lists every served domain, Tailscale first,
 whatever the preference. The agent discovery documents (`/llms.txt`,

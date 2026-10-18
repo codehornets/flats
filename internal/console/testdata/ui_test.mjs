@@ -63,7 +63,11 @@ class Element extends Node {
   remove() { if (this.parentNode) this.parentNode.removeChild(this); }
   contains(n) { for (let x = n; x; x = x.parentNode) if (x === this) return true; return false; }
   querySelector() { return null; }
-  querySelectorAll() { return []; }
+  querySelectorAll(selector) {
+    if (selector === '[data-dirty="true"]') return all(this, (e) => e.getAttribute('data-dirty') === 'true');
+    if (selector === '.savebar') return all(this, (e) => e.className === 'savebar');
+    return [];
+  }
   get childElementCount() { return this.childNodes.filter((c) => c instanceof Element).length; }
   get lastElementChild() { return [...this.childNodes].reverse().find((c) => c instanceof Element) || null; }
   focus() { document.activeElement = this; this.focusedWhileDisabled = !!this.disabled; this.focusCount = (this.focusCount || 0) + 1; }
@@ -785,7 +789,7 @@ const mountSettings = async (params = []) => {
   return main;
 };
 const puts = () => calls.filter((c) => c.key === 'PUT /console/api/settings');
-const savebarOf = (root) => all(root, (e) => (e.getAttribute('class') || '') === 'savebar')[0];
+const savebarOf = (root) => all(root, (e) => ['savebar', 's-inline-actions'].includes(e.getAttribute('class') || ''))[0];
 
 // The left nav names the four sections; Approvals is not a settings section.
 let page = await mountSettings();
@@ -1132,6 +1136,180 @@ assert.equal(settingsPage.toBase('2.5', 3, false), 8);
 const withSettings = (extra, config = CONFIG) => ({ ...settingsRoute(config), settings: { ...SETTINGS, ...extra } });
 const submitLimits = async (p) => { byId(p, 'limits-form').dispatch('submit'); await tick(); };
 routes['PUT /console/api/settings'] = { settings: SETTINGS, applied: ['disk_quota_bytes'], restart_required: [] };
+
+// External origins are staged, validated and saved with the config ETag.
+routes['PUT /console/api/settings'] = () => {
+  const settings = { external_origins: JSON.parse(puts().at(-1).body).external_origins };
+  routes['GET /console/api/settings'] = withSettings(settings);
+  return { applied: ['external_origins'], restart_required: [] };
+};
+routes['GET /console/api/settings'] = withSettings({ external_origins: 'https://flats.example.org' });
+page = await mountSettings(['console']);
+let originsForm = byId(page, 'external-origins-form');
+let originsInput = byId(page, 'set-external_origins');
+assert.equal(originsInput.value, 'https://flats.example.org');
+assert.ok(page.textContent.includes('Flats has no built-in login yet'));
+assert.ok(!savebarOf(originsForm).hidden);
+assert.equal(byId(page, 'external-origins-save').disabled, true);
+assert.equal(byText(originsForm, 'Discard')[0].disabled, true);
+for (const invalid of ['https://flats.example.org/', 'https://UPPER.example.org', 'https://127.0.0.1', 'https://127.1', 'https://0x7f000001', 'https://localhost', 'https://app.localhost', 'https://[::1]', 'https://user@example.org', 'https://example.org?a=1', 'https://example.org#x', 'https://example.org:65536', 'https://example.org:080', 'https://flats.example.org\nhttp://flats.example.org', 'https://flats.example.org\nhttps://flats.example.org:443']) {
+  originsInput.value = invalid;
+  originsForm.dispatch('input');
+  assert.equal(originsInput.getAttribute('aria-invalid'), 'true', invalid);
+  assert.equal(byId(page, 'external-origins-save').disabled, true, invalid);
+}
+byId(page, 'console-preferred').value = 'local';
+byId(page, 'links-form').dispatch('change');
+const beforeOrigins = puts().length;
+originsForm.dispatch('submit');
+await tick();
+assert.equal(puts().length, beforeOrigins, 'invalid origins never reach the API');
+originsInput.value = 'https://flats.example.org\nhttps://other.example.org:8443';
+originsForm.dispatch('input');
+assert.equal(originsInput.getAttribute('aria-invalid'), null);
+assert.equal(byId(page, 'external-origins-save').disabled, false);
+assert.equal(puts().length, beforeOrigins, 'typing only stages the changes');
+assert.equal(all(page, (e) => e.className === 's-inline-actions' && !e.hidden).length, 2, 'both dirty console forms have visible inline actions');
+assert.equal(byId(page, 'links-save').disabled, false);
+byText(originsForm, 'Discard')[0].dispatch('click');
+assert.equal(originsInput.value, 'https://flats.example.org');
+assert.ok(!savebarOf(originsForm).hidden);
+assert.equal(byId(page, 'external-origins-save').disabled, true);
+assert.equal(byText(originsForm, 'Discard')[0].disabled, true);
+originsInput.value = 'https://flats.example.org\nhttps://other.example.org:8443';
+originsForm.dispatch('input');
+originsForm.dispatch('submit');
+await tick();
+assert.equal(JSON.parse(puts().at(-1).body).external_origins, 'https://flats.example.org,https://other.example.org:8443');
+assert.equal(puts().at(-1).headers['If-Match'], '"etag-1"');
+assert.equal(byId(page, 'set-external_origins').value, 'https://flats.example.org\nhttps://other.example.org:8443', 'reload renders saved origins on separate lines');
+assert.equal(byId(page, 'console-preferred').value, 'local', 'saving origins retains unsaved preferred-link edits');
+assert.ok(byId(page, 'external-origins-form').textContent.includes('External origins: saved, applied now.'));
+assert.ok(!byId(page, 'links-form').textContent.includes('saved, applied now.'), 'the links form does not duplicate the origins success notice');
+byId(page, 'links-form').dispatch('submit');
+await tick();
+assert.ok(byId(page, 'links-form').textContent.includes('Address for links: saved, applied now.'));
+assert.ok(!byId(page, 'external-origins-form').textContent.includes('saved, applied now.'), 'the origins form does not duplicate the links success notice');
+// Clearing the field removes the configured entries; an empty list is valid.
+page = await mountSettings(['console']);
+originsForm = byId(page, 'external-origins-form');
+originsInput = byId(page, 'set-external_origins');
+originsInput.value = '';
+originsForm.dispatch('input');
+originsForm.dispatch('submit');
+await tick();
+assert.equal(JSON.parse(puts().at(-1).body).external_origins, '');
+assert.equal(byId(page, 'set-external_origins').value, '');
+// Removing the origin serving this page requires confirmation, including
+// default-port aliases. Cancel and edits during confirmation never submit.
+const originTestLocation = globalThis.location;
+globalThis.location = { origin: 'https://flats.example.org' };
+routes['GET /console/api/settings'] = withSettings({ external_origins: 'https://flats.example.org:443,https://other.example.org' });
+page = await mountSettings(['console']);
+originsForm = byId(page, 'external-origins-form');
+originsInput = byId(page, 'set-external_origins');
+originsInput.value = 'https://other.example.org';
+originsForm.dispatch('input');
+const beforeRemoval = puts().length;
+originsForm.dispatch('submit');
+await tick();
+let removalDialog = all(document.body, (e) => e.tagName === 'DIALOG')[0];
+assert.ok(removalDialog.textContent.includes('will stop working'));
+assert.ok(removalDialog.textContent.includes('has not verified'));
+removalDialog.close('cancel');
+await tick();
+assert.equal(puts().length, beforeRemoval);
+assert.equal(originsInput.value, 'https://other.example.org');
+originsForm.dispatch('submit');
+await tick();
+removalDialog = all(document.body, (e) => e.tagName === 'DIALOG')[0];
+originsInput.value = '';
+originsForm.dispatch('input');
+removalDialog.close('ok');
+await tick();
+assert.equal(puts().length, beforeRemoval, 'stale confirmation cannot save');
+assert.ok(originsForm.textContent.includes('save again'));
+originsForm.dispatch('submit');
+await tick();
+removalDialog = all(document.body, (e) => e.tagName === 'DIALOG')[0];
+assert.ok(removalDialog.textContent.includes('local console'));
+removalDialog.close('ok');
+await tick();
+assert.equal(puts().length, beforeRemoval + 1);
+assert.equal(JSON.parse(puts().at(-1).body).external_origins, '');
+// Comma-separated paste is accepted and shown one per line after saving.
+originsForm = byId(page, 'external-origins-form');
+originsInput = byId(page, 'set-external_origins');
+originsInput.value = 'https://first.example.org, https://second.example.org';
+originsForm.dispatch('input');
+originsForm.dispatch('submit');
+await tick();
+assert.equal(byId(page, 'set-external_origins').value, 'https://first.example.org\nhttps://second.example.org');
+globalThis.location = originTestLocation;
+routes['PUT /console/api/settings'] = { settings: SETTINGS, applied: ['disk_quota_bytes'], restart_required: [] };
+routes['GET /console/api/settings'] = settingsRoute(CONFIG);
+
+// Pending network refreshes must preserve dirty inline forms even when
+// focus is outside a field; clean inline actions must allow refreshes.
+const originalSetTimeout = globalThis.setTimeout;
+const originalClearTimeout = globalThis.clearTimeout;
+let scheduledRefresh;
+globalThis.setTimeout = (fn, delay, ...args) => {
+  if (delay !== 5000) return originalSetTimeout(fn, delay, ...args);
+  const timer = { fn, unref() {} };
+  scheduledRefresh = timer;
+  return timer;
+};
+globalThis.clearTimeout = (timer) => {
+  if (timer?.fn) { if (scheduledRefresh === timer) scheduledRefresh = null; }
+  else originalClearTimeout(timer);
+};
+let stopRefresh;
+try {
+  routes['GET /console/api/console-domains'] = dview({ on: true, domains: [{ name: 'pending', state: 'starting' }] });
+  const refreshPage = new Element('main');
+  stopRefresh = settingsPage.mount(refreshPage, ['console'], ctx);
+  await tick();
+  document.activeElement = document.body;
+  const fireRefresh = async () => { const timer = scheduledRefresh; assert.ok(timer); scheduledRefresh = null; timer.fn(); await tick(); };
+  const reads = () => calls.filter((c) => c.key === 'GET /console/api/settings').length;
+  let beforeReads = reads();
+  await fireRefresh();
+  assert.equal(reads(), beforeReads + 1, 'clean inline forms still refresh');
+  const dirtyInput = byId(refreshPage, 'set-external_origins');
+  dirtyInput.value = 'https://staged.example.org';
+  byId(refreshPage, 'external-origins-form').dispatch('input');
+  routes['GET /console/api/settings'] = { __status: 503, error: 'temporary failure' };
+  beforeReads = reads();
+  await fireRefresh();
+  assert.equal(reads(), beforeReads, 'dirty origins suppress the refresh request');
+  assert.equal(byId(refreshPage, 'set-external_origins'), dirtyInput, 'dirty form is not redrawn');
+  byText(byId(refreshPage, 'external-origins-form'), 'Discard')[0].dispatch('click');
+  byId(refreshPage, 'console-preferred').value = 'local';
+  byId(refreshPage, 'links-form').dispatch('change');
+  await fireRefresh();
+  assert.equal(reads(), beforeReads, 'dirty preferred links also suppress refresh');
+  byText(byId(refreshPage, 'links-form'), 'Discard')[0].dispatch('click');
+  // If editing starts after the request, even a failed response must not
+  // replace the form or erase its validation warning.
+  let finishSettings;
+  routes['GET /console/api/settings'] = () => new Promise((resolve) => { finishSettings = resolve; });
+  await fireRefresh();
+  assert.equal(reads(), beforeReads + 1);
+  dirtyInput.value = 'bad-origin';
+  byId(refreshPage, 'external-origins-form').dispatch('input');
+  finishSettings({ __status: 503, error: 'temporary failure' });
+  await tick();
+  assert.equal(byId(refreshPage, 'set-external_origins'), dirtyInput);
+  assert.equal(dirtyInput.getAttribute('aria-invalid'), 'true');
+  assert.ok(byId(refreshPage, 'external-origins-form').textContent.includes('Address 1:'));
+} finally {
+  stopRefresh?.();
+  globalThis.setTimeout = originalSetTimeout;
+  globalThis.clearTimeout = originalClearTimeout;
+  routes['GET /console/api/settings'] = settingsRoute(CONFIG);
+  routes['GET /console/api/console-domains'] = DOMAINS;
+}
 
 // A small quota is shown exactly instead of rounding to "0", and typing 0
 // turns the quota off.
@@ -1508,7 +1686,7 @@ const lastWrap = all(byId(domMain, 'console-domains'), (e) => e.className === 'd
 assert.ok(lastWrap && lastWrap.getAttribute('data-reason').includes('last domain') && lastWrap.getAttribute('data-reason').includes('loopback'), 'the reason shows on hover');
 assert.equal(lastWrap.getAttribute('tabindex'), '0', 'keyboard users can reach the reason');
 assert.ok(byId(domMain, lastDel.getAttribute('aria-describedby')).textContent.includes('last domain'), 'the reason describes the button');
-assert.deepEqual(all(domMain, (e) => e.tagName === 'H3').map((e) => e.textContent), ['Addresses', 'Links', 'Host']);
+assert.deepEqual(all(domMain, (e) => e.tagName === 'H3').map((e) => e.textContent), ['Addresses', 'Links', 'Reverse proxy', 'Host']);
 // The domain in use cannot be deleted while no other one is ready.
 routes['GET /console/api/console-domains'] = dview({ on: true,
   domains: [{ name: 'flats', url: 'https://flats.tail1234.ts.net', state: 'ready', current: true }, { name: 'next', state: 'starting' }] }, {},
@@ -1597,7 +1775,7 @@ byId(domMain, 'links-form').dispatch('submit');
 await tick();
 await tick();
 assert.equal(byId(domMain, 'console-preferred').value, '', 'the reload shows the stored value');
-assert.equal(savebarOf(domMain).getAttribute('hidden'), '');
+assert.equal(byId(domMain, 'links-save').disabled, true);
 // What the operator does while the reload runs wins over the earlier
 // staged value: a new choice, or Discard.
 const VIEW_P5 = routes['GET /console/api/console-domains'];
@@ -1623,7 +1801,7 @@ for (const [during, want] of [['change', ''], ['discard', '']]) {
   await tick();
   await tick();
   assert.equal(byId(domMain, 'console-preferred').value, want, `${during} during the reload is kept`);
-  assert.equal(savebarOf(domMain).getAttribute('hidden'), '', `${during}: nothing is left staged`);
+  assert.equal(byId(domMain, 'links-save').disabled, true, `${during}: nothing is left staged`);
   releaseDomains = undefined;
 }
 // A staged choice that no longer exists after the reload is dropped: the
@@ -1639,7 +1817,7 @@ all(byId(domMain, 'console-domains'), (e) => e.tagName === 'FORM')[0].dispatch('
 await tick();
 await tick();
 assert.equal(byId(domMain, 'console-preferred').value, '', 'a vanished choice is not restored');
-assert.equal(savebarOf(domMain).getAttribute('hidden'), '');
+assert.equal(byId(domMain, 'links-save').disabled, true);
 // A preferred domain that is not served is warned about, with where links go instead.
 routes['GET /console/api/console-domains'] = dview({ on: true,
   domains: [{ name: 'flats', url: 'https://flats.tail1234.ts.net', state: 'ready' }, { name: 'next', state: 'starting' }] }, {},

@@ -93,10 +93,33 @@ data stay on your machine.
 Local loopback also binds in Tailscale mode: concurrent hosts need distinct
 `host.management_addr`, `host.local_addr` and data directories.
 
+## Serving the console behind a reverse proxy
+
+An existing reverse proxy can forward to the management listener while
+preserving the public `Host`, for example `flats.example.org`. Declare
+`https://flats.example.org` in Settings → Console → External origins first.
+Flats then accepts that authority and generates HTTPS approval, status and
+agent-discovery links even when the upstream connection is HTTP. Preserve
+browser `Origin` headers; do not rewrite them to bypass CSRF checks.
+Forwarded scheme/host headers do not affect URL selection. Configure the proxy
+to preserve the external Host explicitly (for example, nginx defaults to the
+upstream host). Rewriting it to loopback hides the external-origin boundary
+and can make forwarded callers look like local clients; do not use that setup.
+
+The origin setting does not provide TLS, DNS, tunneling or authentication.
+Configure those at the proxy, require authentication (or restrict access to
+a trusted network), and prevent direct untrusted access to the upstream.
+All management routes are exposed, including approval, settings and `/metrics` routes;
+there is no agent-only mode. See [external-origin configuration](configuration.md#external-origins-behind-a-reverse-proxy)
+for validation and live-update behavior. The default empty list preserves
+existing loopback and provider-domain behavior.
+
 ## Scraping metrics
 
 The host serves [`/metrics`](design.md#metrics) in the Prometheus text format
-on the loopback listener and on every console domain. A scraper on the host
+on the loopback listener, every console domain and declared external origins.
+Protect external scrapes with the same proxy authentication or private network
+as the console. A scraper on the host
 itself uses `http://127.0.0.1:7878/metrics` (`host.management_addr`); one on
 another machine uses a console domain, such as
 `https://NAME.<tailnet>.ts.net/metrics` or `http://NAME.<NetBird domain>/metrics`:
