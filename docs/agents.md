@@ -65,6 +65,24 @@ under `plugins/flats/skills/` and release the plugin. `TestPluginSkillBoundary`
 fails when a skill sits on both sides or a plugin manifest points outside
 `plugins/`.
 
+Repository changes follow the [development protocol](development-protocol.md).
+Use [flats-dev-workflow](../.agents/skills/flats-dev-workflow/SKILL.md) for change
+requests, or, when explicitly limited to one stage, invoke [design](../.agents/skills/flats-design/SKILL.md),
+[implementation](../.agents/skills/flats-implement/SKILL.md) or
+[testing](../.agents/skills/flats-test/SKILL.md) independently. Each stage includes
+review by a different model and correction; the shared protocol defines evidence
+and completion. [Repository instructions](../AGENTS.md) provide the default route
+for agents without automatic skill discovery.
+
+The workflow selects [playbooks](../.agents/skills/flats-dev-workflow/SKILL.md#playbooks)
+by change type, such as flaky tests, interface renames or console UI; they add
+steps and known pitfalls inside the stages. Two cleanup skills support the
+stages: [flats-deslop](../.agents/skills/flats-deslop/SKILL.md) removes
+generated-code slop from a branch diff before review, and
+[flats-unslop](../.agents/skills/flats-unslop/SKILL.md) removes generated-writing
+patterns from docs, specs and PR text. Both are adapted from MIT-licensed
+upstream skills; each names its source and carries the license.
+
 The [Flats issue triage skill](../.agents/skills/flats-issue-triage/SKILL.md)
 classifies repository issues with a small workflow-oriented label set, checks
 relevant specs and code, and proposes evidence-backed duplicate candidates. Its `triaged` label marks
