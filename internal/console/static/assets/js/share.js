@@ -2,6 +2,7 @@ import { h, icon, VISIBILITY, visibilityOf, PUBLIC_ACCESS_NOTICE } from './dom.j
 import { api } from './api.js';
 import { setVisibility } from './actions.js';
 import { busy, fill, toast, extLink, serverOnly, loopbackHost, SERVER_ONLY } from './ui.js';
+import { isLive } from './list.js';
 
 export function shareDialog(initial, onChange = () => {}) {
   let flat = initial;
@@ -135,9 +136,8 @@ export function shareRoute(flat) {
   const state = route ? route.state : (isPublic ? flat.connection_state : flat.private_state);
   const ready = route ? route.ready === true : !state || state === 'ready' || state === 'key-expiring';
   const out = { url, provider: route?.provider || '', usable: false, message: '' };
-  if (!flat.live_version) {
-    out.message = ['docs', 'design'].includes(flat.type) ? 'This flat is not running.' : 'This flat has not been published yet.';
-  } else if (flat.running === false) out.message = 'This flat is not running.';
+  if (!isLive(flat) && !flat.live_version) out.message = 'This flat has not been published yet.';
+  else if (flat.running === false) out.message = 'This flat is not running.';
   else if (url && ready) {
     out.usable = true;
     out.message = serverOnly(url) ? SERVER_ONLY : state ? 'Link is ready.' : 'Link available.';

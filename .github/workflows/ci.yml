@@ -113,8 +113,13 @@ jobs:
         run: go test -race ./internal/core ./internal/api ./internal/app ./internal/mcpx ./internal/store ./internal/expose/portal
       - name: FILES concurrency races
         run: go test -race ./internal/runtime -run 'TestConcurrentFiles|TestWASIRejectsJSHostABI'
+      - name: WebSocket codec races
+        run: go test -race ./internal/wsconn
+      - name: Board races
+        # benchdata only generates fixed reference data; it is slow under -race.
+        run: go test -race $(go list ./internal/board/... | grep -v /benchdata)
       - name: WebSocket resource limit races
-        run: go test -race ./internal/runtime -run 'TestWebSocket(AdmissionCeiling|RejectedUpgrade|PostFailureReleasesSlot|IdleReadDeadline|ControlFramesKeepReadAlive|ServerPingsKeepIdleClientAlive|DefaultByteLimits)$'
+        run: go test -race ./internal/runtime -run 'TestWebSocket(AdmissionCeiling|RejectedUpgrade|PostFailureReleasesSlot|DefaultByteLimits|MessageLimit)$'
 
   install-script:
     strategy:
