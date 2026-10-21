@@ -148,6 +148,9 @@ written; `flats config unset KEY` removes it.
 | `host.console_addr` | `127.0.0.1:7878`; console, HTTP API and MCP listener | restart |
 | `host.local_addr` | `127.0.0.1:7879` | restart |
 | `host.server_runtime` | `true` | restart |
+| `metrics.enabled` | `true` | restart |
+| `metrics.expose_on` | `["localhost"]`; unique entries from `localhost`, `console`, `external`; `[]` exposes nowhere | restart |
+| `metrics.per_flat` | `true`; set `false` to omit per-flat Prometheus series | restart |
 | `network.permitted` | `[]` | immediately from the console; otherwise restart |
 | `network.private_backend` | `local` | restart |
 | `network.default_private` | `""` (follow `private_backend`) | immediately, for flats created afterwards |
@@ -370,6 +373,78 @@ served, such as one being deleted) names the preferred console,
 - When the console is deleted through the domain it is open on, the page
   moves to the preferred domain if it is ready, else to the first ready one
   in the same order.
+
+### Prometheus metrics
+
+Metrics are enabled by default on the management listener, including per-flat
+Prometheus series. These defaults also apply to existing installations when
+these new keys are absent. The per-flat controls are unreleased; their earlier
+false default never became a released configuration default. Released metrics
+always included per-flat series, so this true default preserves that behavior.
+Configuration schema 5 already includes the `host.console_addr` rename;
+metrics controls need no further schema change or migration:
+
+```json
+{
+  "metrics": {
+    "enabled": true,
+    "expose_on": ["localhost"],
+    "per_flat": true
+  }
+}
+```
+
+`expose_on` accepts a unique list of `localhost` (the `host.console_addr`
+management listener), `console` (managed Tailscale and NetBird console domains),
+and `external`
+(requests through `console.external_origins`). An external-origin request
+remains external when its reverse proxy connects over loopback. Unknown names,
+duplicates and values that are not lists are invalid. `[]` exposes nowhere.
+The unreleased `loopback` spelling is invalid; it is not an alias.
+`localhost` names the listener category, not a DNS-name or client-source-IP
+filter. Changing `host.console_addr` to a non-loopback address also changes
+where that listener can be reached.
+
+With `enabled: false`, or on an excluded access point, admitted requests
+return 404 without `Allow`. Existing Host and Origin guards still reject
+invalid requests with 403, and GET/HEAD still reject cross-site browser
+requests with 403. An enabled, selected endpoint serves GET/HEAD and returns
+405 with `Allow: GET, HEAD` for other methods. These settings add no
+authentication and do not change the endpoint path or port.
+
+`per_flat: false` omits every per-flat Prometheus series, including request,
+worker, preview/check CPU and storage series. Host process figures, aggregate
+flat and network counts, management requests and host-wide board metrics
+remain. By default, or with explicit `per_flat: true`, metrics export the
+existing series with flat slugs, including Private and unpublished flats.
+Only allow trusted scrapers to reach the endpoint. Analytics, its stats API
+and usage collection continue with either setting, even when Prometheus
+metrics are disabled.
+The unreleased `metrics.flat_metrics` key is invalid; use `metrics.per_flat`.
+This name change adds no alias, migration or schema revision.
+
+Stop the host, use `flats config set` or edit `config.json`, then restart it.
+For example, these offline commands enable console-domain scraping while
+omitting per-flat series:
+
+```sh
+flats config set metrics.expose_on localhost,console
+flats config set metrics.per_flat false
+```
+
+Per-flat series are included by default. To retain the exposure from before
+these controls were introduced, explicitly set:
+
+```json
+{
+  "metrics": {
+    "enabled": true,
+    "expose_on": ["localhost", "console", "external"]
+  }
+}
+```
+
+See [Scraping metrics](networking.md#scraping-metrics) for scraper setup.
 
 ### Operator keys
 
