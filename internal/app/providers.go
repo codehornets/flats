@@ -30,7 +30,9 @@ type ProviderInfo struct {
 	Locked      string          `json:"locked,omitempty"`         // why the console cannot change it
 	Flats       []string        `json:"flats"`                    // flats that allow it
 	Status      *core.NetStatus `json:"status,omitempty"`         // backend hosts
-	Address     string          `json:"address,omitempty"`        // local listener
+	Address     string          `json:"address,omitempty"`        // local and reverse proxy listener
+	Template    string          `json:"template,omitempty"`       // proxy: proxy.url_template in effect
+	BindError   string          `json:"bind_error,omitempty"`     // proxy: why the listener did not bind at start
 	AuthKey     bool            `json:"auth_key,omitempty"`       // tailscale: an auth key is stored
 	ConsoleOn   bool            `json:"console_on,omitempty"`     // tailscale: the console or private routes use it
 	Namespace   string          `json:"namespace,omitempty"`      // zrok: the namespace names are reserved in
@@ -66,14 +68,15 @@ func legacyNetworkPins(o Options) map[provider.ID]string {
 func (h *Host) NetworkProviders(ctx context.Context) any {
 	flats := h.flatsAllowing(ctx)
 	h.pmu.Lock()
-	ts, pn, zn, qn, nn := h.tsNet, h.portalNet, h.zrokNet, h.quickNet, h.netbirdNet
+	ts, pn, zn, qn, nn, px := h.tsNet, h.portalNet, h.zrokNet, h.quickNet, h.netbirdNet, h.proxyNet
+	proxyAddr, bindErr := h.proxyAddressLocked(), h.proxyBindErrorLocked()
 	h.pmu.Unlock()
 	var grants provider.File
 	if h.Providers != nil {
 		grants = h.Providers.File()
 	}
-	out := make([]ProviderInfo, 0, 8)
-	for _, id := range []provider.ID{provider.Local, provider.Tailscale, provider.Netbird, provider.Funnel, provider.Portal, provider.Zrok, provider.CFQuick, provider.NetbirdExpose} {
+	out := make([]ProviderInfo, 0, 10)
+	for _, id := range []provider.ID{provider.Local, provider.Tailscale, provider.Netbird, provider.Proxy, provider.Funnel, provider.Portal, provider.Zrok, provider.CFQuick, provider.NetbirdExpose, provider.ProxyPublic} {
 		p := ProviderInfo{ID: string(id), Scope: "private", Enabled: grants.Allows(id), Flats: flats[id]}
 		if p.Flats == nil {
 			p.Flats = []string{}
@@ -159,6 +162,19 @@ func (h *Host) NetworkProviders(ctx context.Context) any {
 				st := qn.Status()
 				p.Status = &st
 			}
+		case provider.Proxy, provider.ProxyPublic:
+			if id == provider.ProxyPublic {
+				p.Scope = "public"
+			}
+			// Both kinds share one listener; it belongs to the one turned on.
+			p.Configured = px != nil && p.Enabled
+			p.Address = "http://" + proxyAddr
+			p.Template = h.proxyTemplate().String()
+			if p.Configured {
+				p.BindError = bindErr
+				st := px.Status()
+				p.Status = &st
+			}
 		}
 		out = append(out, p)
 	}
@@ -186,6 +202,29 @@ func (h *Host) SetNetworkProvider(ctx context.Context, raw string, enabled bool,
 	}
 	h.pmu.Lock()
 	defer h.pmu.Unlock()
+	previous := h.Svc.PermittedNetworks()
+	permitted := slices.Clone(previous)
+	if enabled {
+		if !slices.Contains(permitted, string(id)) {
+			permitted = append(permitted, string(id))
+		}
+	} else {
+		permitted = slices.DeleteFunc(permitted, func(p string) bool { return p == string(id) })
+	}
+	// A listener this call binds is closed again if the change is not saved.
+	var bound provider.ProxyNet
+	if enabled && proxyKind(id) && h.proxyNet == nil {
+		// Check the other kind and the template before binding anything.
+		if err := h.Svc.CheckPermittedNetworks(permitted); err != nil {
+			return "", err
+		}
+		n, err := listenProxy(h.Svc.ProxyConfig().Addr, h.proxyTemplate)
+		if err != nil {
+			return "", fmt.Errorf("%w: %v", core.ErrConflict, err)
+		}
+		bound, h.proxyNet = n, n
+		h.Providers.AttachProxy(n)
+	}
 	if enabled {
 		if err := h.attachLocked(id); err != nil {
 			return "", err
@@ -204,21 +243,63 @@ func (h *Host) SetNetworkProvider(ctx context.Context, raw string, enabled bool,
 			return "", fmt.Errorf("%w: the console and private routes run on Tailscale; set network.private_backend to local first", core.ErrConflict)
 		}
 	}
-	permitted := h.Svc.PermittedNetworks()
 	if enabled {
-		if !slices.Contains(permitted, string(id)) {
-			permitted = append(permitted, string(id))
+		etag, err := h.Svc.SetPermittedNetworks(permitted, ifMatch)
+		if err != nil {
+			if bound != nil {
+				h.closeProxyLocked()
+			}
+			return "", err
 		}
-	} else {
-		permitted = slices.DeleteFunc(permitted, func(p string) bool { return p == string(id) })
+		if err := h.setGrantLocked(id, true); err != nil {
+			// Undo the save, so a refused change saves nothing.
+			if _, rerr := h.Svc.SetPermittedNetworks(previous, etag); rerr != nil {
+				err = fmt.Errorf("%w; restoring network.permitted also failed: %v", err, rerr)
+			}
+			if bound != nil {
+				h.closeProxyLocked()
+			}
+			return "", err
+		}
+		return h.providerChangedLocked(id, enabled, etag), nil
+	}
+	// Turning off: stop new routes and release the proxy backend before
+	// saving, so a refusal on the way saves nothing.
+	was := h.Providers.HostAllows(id)
+	if err := h.setGrantLocked(id, false); err != nil {
+		return "", err
+	}
+	detached := false
+	if proxyKind(id) && h.proxyNet != nil {
+		// Revoking every flat's grant stopped every proxy route, so a route
+		// left here is a defect; keep its listener rather than close it.
+		if !h.Providers.DetachProxy() {
+			h.restoreGrantLocked(id, was)
+			return "", fmt.Errorf("a reverse proxy route is still registered, so %s stays on and its listener open; restart Flats to clear it", id)
+		}
+		detached = true
 	}
 	etag, err := h.Svc.SetPermittedNetworks(permitted, ifMatch)
 	if err != nil {
+		if detached {
+			h.Providers.AttachProxy(h.proxyNet)
+		}
+		h.restoreGrantLocked(id, was)
 		return "", err
 	}
-	if _, err := h.Providers.SetGrant(id, enabled); err != nil {
-		return "", err
+	if detached {
+		if err := h.proxyNet.Close(); err != nil {
+			h.logf("reverse proxy listener shutdown: %v", err)
+		}
+		h.proxyNet = nil
 	}
+	return h.providerChangedLocked(id, enabled, etag), nil
+}
+
+// providerChangedLocked finishes a saved provider change: it refreshes the
+// backend parts of the approval policy and logs the change. It returns etag.
+// h.pmu is held.
+func (h *Host) providerChangedLocked(id provider.ID, enabled bool, etag string) string {
 	if id == provider.Zrok {
 		h.syncZrokConfigurationLocked()
 	}
@@ -226,7 +307,37 @@ func (h *Host) SetNetworkProvider(ctx context.Context, raw string, enabled bool,
 		h.syncNetbirdConfigurationLocked()
 	}
 	h.logf("provider %s enabled=%t from the console", id, enabled)
-	return etag, nil
+	return etag
+}
+
+// setGrantLocked records id's host grant in the provider manager. h.pmu is
+// held.
+func (h *Host) setGrantLocked(id provider.ID, permitted bool) error {
+	if h.testGrantFailure != nil {
+		if err := h.testGrantFailure(id, permitted); err != nil {
+			return err
+		}
+	}
+	_, err := h.Providers.SetGrant(id, permitted)
+	return err
+}
+
+// restoreGrantLocked puts back the host grant of id that a refused turn-off
+// removed. h.pmu is held.
+func (h *Host) restoreGrantLocked(id provider.ID, permitted bool) {
+	if _, err := h.Providers.SetGrant(id, permitted); err != nil {
+		h.logf("restore the %s grant after a refused change: %v", id, err)
+	}
+}
+
+// closeProxyLocked detaches and closes the reverse proxy listener, freeing
+// its address. h.pmu is held.
+func (h *Host) closeProxyLocked() {
+	h.Providers.DetachProxy()
+	if err := h.proxyNet.Close(); err != nil {
+		h.logf("reverse proxy listener shutdown: %v", err)
+	}
+	h.proxyNet = nil
 }
 
 // attachLocked starts the backend id needs, if this process has none yet.

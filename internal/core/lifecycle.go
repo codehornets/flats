@@ -114,6 +114,12 @@ func (s *Service) lifecycleNet() (LifecycleNet, bool) {
 	return nil, false
 }
 
+// providerKeyWhat names what a changed providerKey means in a stale
+// approval: the flat's provider permissions, or the host's network
+// configuration that ExposurePolicy covers (such as the reverse proxy
+// template and kind, or the zrok and NetBird accounts).
+const providerKeyWhat = "provider permissions or network configuration"
+
 func (s *Service) providerKey(ctx context.Context, slugName string) (string, error) {
 	ps, err := s.st.PermittedProviders(ctx, slugName)
 	if err != nil {
@@ -389,19 +395,15 @@ func (s *Service) publicAvailable(ctx context.Context, slugName string) error {
 	if err != nil {
 		return err
 	}
-	zrok, err := s.st.ProviderPermitted(ctx, slugName, store.ProviderZrok)
-	if err != nil {
-		return err
+	other := false
+	for _, id := range []string{store.ProviderZrok, store.ProviderCFQuick, store.ProviderNetbirdExpose, store.ProviderProxyPublic} {
+		permitted, err := s.st.ProviderPermitted(ctx, slugName, id)
+		if err != nil {
+			return err
+		}
+		other = other || permitted
 	}
-	quick, err := s.st.ProviderPermitted(ctx, slugName, store.ProviderCFQuick)
-	if err != nil {
-		return err
-	}
-	expose, err := s.st.ProviderPermitted(ctx, slugName, store.ProviderNetbirdExpose)
-	if err != nil {
-		return err
-	}
-	if _, ok := s.lifecycleNet(); ok && (portal || funnel || zrok || quick || expose) {
+	if _, ok := s.lifecycleNet(); ok && (portal || funnel || other) {
 		return nil
 	}
 	if portal && s.cfg.Public != nil {
@@ -410,7 +412,7 @@ func (s *Service) publicAvailable(ctx context.Context, slugName string) error {
 	if portal && s.cfg.Public == nil {
 		return errPublicDisabled()
 	}
-	return fmt.Errorf("%w: %w: permit tailscale-funnel, portal, zrok, cloudflare-quick or netbird-expose before making this flat public", ErrConflict, ErrProviderNotPermitted)
+	return fmt.Errorf("%w: %w: permit tailscale-funnel, portal, zrok, cloudflare-quick, netbird-expose or proxy-public before making this flat public", ErrConflict, ErrProviderNotPermitted)
 }
 
 // SetProviderPermission records an explicit non-local provider permission.
@@ -430,7 +432,8 @@ func (s *Service) SetProviderPermission(ctx context.Context, slugName, provider 
 		return forbiddenf("only the operator can permit a network provider")
 	}
 	switch provider {
-	case store.ProviderTailscale, store.ProviderFunnel, store.ProviderPortal, store.ProviderZrok, store.ProviderCFQuick, store.ProviderNetbird, store.ProviderNetbirdExpose:
+	case store.ProviderTailscale, store.ProviderFunnel, store.ProviderPortal, store.ProviderZrok, store.ProviderCFQuick, store.ProviderNetbird, store.ProviderNetbirdExpose,
+		store.ProviderProxy, store.ProviderProxyPublic:
 	case store.ProviderLocal:
 		return invalidf("local is always permitted")
 	default:
@@ -460,13 +463,13 @@ func (s *Service) SetProviderPermission(ctx context.Context, slugName, provider 
 }
 
 // applyProviderGrant opens the explicitly granted current route on a live flat:
-// private mesh providers may serve either visibility; public providers may
+// private route providers may serve either visibility; public providers may
 // serve only an already Public flat. The legacy backend needs no re-run.
 // Only the granted endpoint decides success; a sibling route's error is logged,
 // not returned. Rename aliases keep their routes until the next restart.
 func (s *Service) applyProviderGrant(ctx context.Context, f store.Flat, provider ProviderID) error {
 	publicGrant := PublicProvider(provider) && f.Visibility.Public()
-	if !PrivateMeshProvider(provider) && !publicGrant {
+	if !PrivateRouteProvider(provider) && !publicGrant {
 		return nil
 	}
 	return s.reapplyExposure(ctx, f, provider, publicGrant)
@@ -743,7 +746,7 @@ func (s *Service) applyPublishApproval(ctx context.Context, a store.Approval) (A
 		return ActionResult{}, err
 	}
 	if providers != p.Providers {
-		return ActionResult{}, mismatch(p.Providers, providers, "provider permissions")
+		return ActionResult{}, mismatch(p.Providers, providers, providerKeyWhat)
 	}
 	draft, err := s.st.GetDraft(ctx, a.Flat)
 	if err != nil {
@@ -944,7 +947,7 @@ func (s *Service) applyActivateApproval(ctx context.Context, a store.Approval) (
 		return ActionResult{}, err
 	}
 	if providers != p.Providers {
-		return ActionResult{}, mismatch(p.Providers, providers, "provider permissions")
+		return ActionResult{}, mismatch(p.Providers, providers, providerKeyWhat)
 	}
 	v, err := s.st.GetVersion(ctx, a.Flat, p.Version)
 	if err != nil {
@@ -995,7 +998,7 @@ func (s *Service) applyRollbackApproval(ctx context.Context, a store.Approval) (
 		return ActionResult{}, err
 	}
 	if providers != p.Providers {
-		return ActionResult{}, mismatch(p.Providers, providers, "provider permissions")
+		return ActionResult{}, mismatch(p.Providers, providers, providerKeyWhat)
 	}
 	v, err := s.st.GetVersion(ctx, a.Flat, p.Version)
 	if err != nil {
@@ -1099,7 +1102,7 @@ func (s *Service) applyVisibilityApproval(ctx context.Context, a store.Approval)
 		return ActionResult{}, err
 	}
 	if providers != p.Providers {
-		return ActionResult{}, mismatch(p.Providers, providers, "provider permissions")
+		return ActionResult{}, mismatch(p.Providers, providers, providerKeyWhat)
 	}
 	if f.Visibility.Canonical() == target && f.PublicAccess == access {
 		res := ActionResult{Status: "done", Message: "visibility unchanged"}
@@ -1317,7 +1320,7 @@ func (s *Service) ensureLifecycle(ctx context.Context, f store.Flat, ln Lifecycl
 // error when a sibling provider failed.
 func privateRegistrationOpened(res ExposureResult, host string, audience ExposureAudience) bool {
 	for _, ep := range res.Endpoints {
-		if (ep.Provider == ProviderLocal || PrivateMeshProvider(ep.Provider)) && ep.Host == host && ep.Audience == audience && ep.Configured && ep.Permitted && privateRouteOpen(ep.State) {
+		if (ep.Provider == ProviderLocal || PrivateRouteProvider(ep.Provider)) && ep.Host == host && ep.Audience == audience && ep.Configured && ep.Permitted && privateRouteOpen(ep.State) {
 			return true
 		}
 	}
@@ -1552,7 +1555,7 @@ func (s *Service) servePreview(ctx context.Context, slugName, host string, h htt
 		if err != nil {
 			return "", err
 		}
-		if where := previewLocation(res.Endpoints, host); where != "" {
+		if where := previewLocation(res.Endpoints, host, s.privateDefault()); where != "" {
 			return where, nil
 		}
 		return s.cfg.Private.URL(host), nil
@@ -1560,22 +1563,27 @@ func (s *Service) servePreview(ctx context.Context, slugName, host string, h htt
 	return s.cfg.Private.Serve(ctx, host, h, true)
 }
 
-// previewLocation describes where a preview opened, for its event. It
-// prefers the tailnet address, as the flat's own private URL does, because a
-// loopback URL opens only on the host machine. A tailnet node that has not
-// yet learned its MagicDNS name reports a placeholder URL; the event then
-// names the host instead of keeping that placeholder.
-func previewLocation(endpoints []ExposureEndpoint, host string) string {
-	best, tailnet := "", false
+// previewLocation describes where a preview opened, for its event. It picks
+// the address as the preview list does: the host's private default, else
+// the tailnet before loopback, because a loopback URL opens only on the host
+// machine. A tailnet node that has not yet learned its MagicDNS name reports
+// a placeholder URL; the event then names the host instead of keeping that
+// placeholder.
+func previewLocation(endpoints []ExposureEndpoint, host string, def ProviderID) string {
+	var eps []ExposureEndpoint
 	for _, ep := range endpoints {
-		if ep.URL != "" && (best == "" || ep.Provider == ProviderTailscale) {
-			best, tailnet = ep.URL, ep.Provider == ProviderTailscale
+		if ep.URL != "" && slices.Contains(previewOrder, ep.Provider) {
+			eps = append(eps, ep)
 		}
 	}
-	if tailnet && strings.Contains(best, "<tailnet>") {
+	ep, ok := preferredRoute(eps, def, previewOrder)
+	if !ok {
+		return ""
+	}
+	if ep.Provider == ProviderTailscale && strings.Contains(ep.URL, "<tailnet>") {
 		return "tailnet host " + host + " (address pending)"
 	}
-	return best
+	return ep.URL
 }
 
 func copyTree(src, dst string) error {
@@ -1671,7 +1679,7 @@ func (s *Service) migrateLegacyDrafts(ctx context.Context) error {
 func privateProviders(ids []ProviderID) []ProviderID {
 	out := []ProviderID{ProviderLocal}
 	for _, id := range ids {
-		if PrivateMeshProvider(id) {
+		if PrivateRouteProvider(id) {
 			out = append(out, id)
 		}
 	}
@@ -1975,10 +1983,11 @@ func (s *Service) restorePreviews(ctx context.Context) {
 	}
 }
 
-// revokeProviderRoutes narrows only Private Tailscale access. Public routes
-// still require the approved Public-to-Private transition before revocation.
+// revokeProviderRoutes narrows only Private Tailscale, NetBird and reverse
+// proxy access. Public routes still require the approved Public-to-Private
+// transition before revocation.
 func (s *Service) revokeProviderRoutes(ctx context.Context, slug string, id ProviderID) error {
-	if !PrivateMeshProvider(id) {
+	if !PrivateRouteProvider(id) {
 		return s.providerNotInUse(ctx, slug, id)
 	}
 	stopper, ok := s.cfg.Lifecycle.(LifecycleProviderStopper)
@@ -2040,7 +2049,9 @@ func (s *Service) providerNotInUse(ctx context.Context, slug string, id Provider
 	}
 	// An adapter without route inspection cannot prove a running provider idle.
 	lf := s.state(slug)
-	if ((id == ProviderPortal || id == ProviderZrok || id == ProviderCloudflareQuick || id == ProviderNetbirdExpose) && lf.publicServed) || (PrivateMeshProvider(id) && lf.privateServed) || s.cfg.Lifecycle != nil {
+	// Funnel is left out here, as it always was.
+	publicIDs := []ProviderID{ProviderPortal, ProviderZrok, ProviderCloudflareQuick, ProviderNetbirdExpose, ProviderProxyPublic}
+	if (slices.Contains(publicIDs, id) && lf.publicServed) || (PrivateRouteProvider(id) && lf.privateServed) || s.cfg.Lifecycle != nil {
 		return fmt.Errorf("%w: cannot confirm %s routes are stopped", ErrProviderInUse, id)
 	}
 	return nil
