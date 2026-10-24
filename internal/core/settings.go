@@ -113,7 +113,10 @@ type SettingsSource struct {
 	// readers never wait for a save that holds mu.
 	proxy  atomic.Pointer[config.ProxyConfig]
 	pinned map[string]string // setting -> who sets it
-	file   *SettingsFile
+	// pinnedProviders are the providers whose network.permitted membership
+	// a service flag sets: provider -> who sets it.
+	pinnedProviders map[string]string
+	file            *SettingsFile
 }
 
 // SettingsFile is the config.json behind a SettingsSource.
@@ -131,6 +134,8 @@ type SettingsFile struct {
 	Save func(expected string, apply func(*config.Document) error) (string, error)
 	// DiskHash returns the hash of the file on disk now.
 	DiskHash func() (string, error)
+	// Load reads and validates the file on disk, as a start does.
+	Load func() (*config.Loaded, error)
 }
 
 // ErrConfigOverridden rejects a change to a setting that the running
@@ -152,6 +157,18 @@ func (s *SettingsSource) Pin(setting, by string) {
 		s.pinned = map[string]string{}
 	}
 	s.pinned[setting] = by
+}
+
+// PinProvider records that by, such as "the service's --portal flag", sets
+// whether network.permitted lists id; a reload refuses a file that changes
+// it. The host refuses console changes to it itself.
+func (s *SettingsSource) PinProvider(id, by string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pinnedProviders == nil {
+		s.pinnedProviders = map[string]string{}
+	}
+	s.pinnedProviders[id] = by
 }
 
 // NewSettingsSource serves the settings of doc, saved to file (nil keeps
@@ -278,7 +295,7 @@ func (s *SettingsSource) commit(ifMatch string, apply func(*config.Document) err
 				if ifMatch != "" {
 					return errChangedOnDisk()
 				}
-				return withKind(ErrConflict, fmt.Errorf("config.json changed on disk since Flats loaded it; restart `flats serve` to load the file, then retry: %w", err))
+				return withKind(ErrConflict, fmt.Errorf("config.json changed on disk since Flats loaded it; send SIGHUP or restart `flats serve` to load the file, then retry: %w", err))
 			}
 			var fe *config.FieldError
 			if errors.As(err, &fe) {
@@ -584,7 +601,7 @@ func (s *Service) SettingsETag() string {
 }
 
 func errChangedOnDisk() error {
-	return withKind(ErrConfigChanged, errors.New("config.json changed on disk since Flats loaded it; restart Flats to load the file, then retry"))
+	return withKind(ErrConfigChanged, errors.New("config.json changed on disk since Flats loaded it; send SIGHUP or restart Flats to load the file, then retry"))
 }
 
 // changedOnDisk reports whether the file on disk is not the one the host
@@ -605,7 +622,7 @@ type ConfigView struct {
 	// ETag is the hash of the file the host last read or wrote.
 	ETag string `json:"etag"`
 	// ChangedOnDisk reports that the file differs from ETag (or cannot be
-	// read); a restart loads it.
+	// read); a SIGHUP reload or a restart loads it.
 	ChangedOnDisk bool `json:"changed_on_disk"`
 	Host          struct {
 		ConsoleAddr   string `json:"console_addr"`
@@ -770,7 +787,15 @@ func (s *Service) UpdateSettingsMatch(ctx context.Context, in map[string]string,
 		}
 		return SettingsUpdate{}, err
 	}
-	if _, ok := clean[SetRateLimit]; ok {
+	s.applySettingChanges(ctx, changed)
+	all, _ := s.Settings(ctx)
+	return SettingsUpdate{Settings: all, Changed: changed, ETag: etag}, nil
+}
+
+// applySettingChanges runs the side effects of stored settings whose value
+// changed, after a console save or a config.json reload stored them.
+func (s *Service) applySettingChanges(ctx context.Context, changed []string) {
+	if slices.Contains(changed, SetRateLimit) {
 		s.mu.Lock()
 		for _, lf := range s.live {
 			lf.limiter.setRate(s.rateLimit())
@@ -787,8 +812,6 @@ func (s *Service) UpdateSettingsMatch(ctx context.Context, in map[string]string,
 		s.pushAllDocsBudgets(ctx)
 		s.remeasureBoards()
 	}
-	all, _ := s.Settings(ctx)
-	return SettingsUpdate{Settings: all, Changed: changed, ETag: etag}, nil
 }
 
 // updateSettingsChecked saves clean unless it would leave a board anyone

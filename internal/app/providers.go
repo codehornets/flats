@@ -203,6 +203,13 @@ func (h *Host) SetNetworkProvider(ctx context.Context, raw string, enabled bool,
 	h.pmu.Lock()
 	defer h.pmu.Unlock()
 	previous := h.Svc.PermittedNetworks()
+	// The two reverse proxy kinds share one listener; the settings check
+	// below refuses the second while the list names the first. A config
+	// reload can remove the first from the list while flats allow it, and
+	// its grant then stays on until the next start.
+	if other := otherProxyKind(id); enabled && proxyKind(id) && h.Providers.HostAllows(other) && !slices.Contains(previous, string(other)) {
+		return "", fmt.Errorf("%w: %s stays on until the next start because flats still allow it, and it shares its listener with %s; stop allowing %s on every flat and turn it off first", core.ErrConflict, other, id, other)
+	}
 	permitted := slices.Clone(previous)
 	if enabled {
 		if !slices.Contains(permitted, string(id)) {
@@ -261,7 +268,7 @@ func (h *Host) SetNetworkProvider(ctx context.Context, raw string, enabled bool,
 			}
 			return "", err
 		}
-		return h.providerChangedLocked(id, enabled, etag), nil
+		return h.providerChangedLocked(id, enabled, etag, "from the console"), nil
 	}
 	// Turning off: stop new routes and release the proxy backend before
 	// saving, so a refusal on the way saves nothing.
@@ -293,20 +300,20 @@ func (h *Host) SetNetworkProvider(ctx context.Context, raw string, enabled bool,
 		}
 		h.proxyNet = nil
 	}
-	return h.providerChangedLocked(id, enabled, etag), nil
+	return h.providerChangedLocked(id, enabled, etag, "from the console"), nil
 }
 
 // providerChangedLocked finishes a saved provider change: it refreshes the
-// backend parts of the approval policy and logs the change. It returns etag.
-// h.pmu is held.
-func (h *Host) providerChangedLocked(id provider.ID, enabled bool, etag string) string {
+// backend parts of the approval policy and logs the change, naming where it
+// came from. It returns etag. h.pmu is held.
+func (h *Host) providerChangedLocked(id provider.ID, enabled bool, etag, source string) string {
 	if id == provider.Zrok {
 		h.syncZrokConfigurationLocked()
 	}
 	if id == provider.Netbird || id == provider.NetbirdExpose {
 		h.syncNetbirdConfigurationLocked()
 	}
-	h.logf("provider %s enabled=%t from the console", id, enabled)
+	h.logf("provider %s enabled=%t %s", id, enabled, source)
 	return etag
 }
 
@@ -431,13 +438,19 @@ func (h *Host) currentPortalOptions() portal.Config {
 
 // flatsAllowing maps each non-local provider to the flats that allow it.
 func (h *Host) flatsAllowing(ctx context.Context) map[provider.ID][]string {
+	out, _ := h.flatsAllowingErr(ctx)
+	return out
+}
+
+// flatsAllowingErr is flatsAllowing, with the error of listing the flats.
+func (h *Host) flatsAllowingErr(ctx context.Context) (map[provider.ID][]string, error) {
 	out := map[provider.ID][]string{}
 	if h.Svc == nil {
-		return out
+		return out, nil
 	}
 	fs, err := h.Svc.ListFlats(ctx)
 	if err != nil {
-		return out
+		return out, err
 	}
 	for _, f := range fs {
 		for _, p := range f.Providers {
@@ -447,7 +460,7 @@ func (h *Host) flatsAllowing(ctx context.Context) map[provider.ID][]string {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // syncZrokConfigurationLocked sets the zrok part of the policy token to what
