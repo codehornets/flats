@@ -731,8 +731,10 @@ func TestGuestUpdateLimits(t *testing.T) {
 
 // When all guests together reach the flat's limit, updates are answered
 // busy and resent later in order; nothing is lost or applied twice.
+// Serial, in the docs-budget shard: the guest buckets refill over time, so
+// the busy answers and the receipts that keep the writers under the output
+// limit depend on the worker keeping up with the wall clock.
 func TestGuestBusyResendKeepsOrder(t *testing.T) {
-	t.Parallel()
 	a := startApp(t, t.TempDir(), initialText, "v1")
 	a.setAccess(t, "edit", 1)
 	const guests, each = 10, 10
@@ -787,7 +789,12 @@ func TestGuestBusyResendKeepsOrder(t *testing.T) {
 		var updates [][2]string
 		clock := uint64(0)
 		for part := 0; part < each; part++ {
-			text := fmt.Sprintf("[%02d-%02d]%s", i, part, strings.Repeat("p", 4000))
+			// Every update reaches the other nine writers, and guests share
+			// 4 MiB of unconfirmed output (LIMITS.publicSendBytes). Parts of
+			// 4,000 characters added up to about 4.9 MB, so a worker slowed
+			// by the flood closed every writer as a slow consumer before
+			// their receipts arrived. These parts stay near 1.3 MB.
+			text := fmt.Sprintf("[%02d-%02d]%s", i, part, strings.Repeat("p", 1000))
 			u := yInsert(client, text)
 			if part > 0 {
 				u = yAfter(client, clock, text)
@@ -798,11 +805,13 @@ func TestGuestBusyResendKeepsOrder(t *testing.T) {
 		// Like a page, a reader takes every frame and confirms it; the
 		// writer sees the answers to its updates.
 		answers := make(chan map[string]any, 64)
+		var readErr error
 		go func() {
 			defer close(answers)
 			for {
 				m, err := g.read()
 				if err != nil {
+					readErr = err
 					return
 				}
 				if n, ok := m["n"].(float64); ok {
@@ -817,6 +826,11 @@ func TestGuestBusyResendKeepsOrder(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// A writer that stops early still ends its first round, so the
+			// flood stops and the test reports the failure instead of
+			// running until the package timeout.
+			firstDone := sync.OnceFunc(firstRound.Done)
+			defer firstDone()
 			pending, retry := updates, false
 			for round := 0; len(pending) > 0; round++ {
 				if round > 20 {
@@ -840,7 +854,8 @@ func TestGuestBusyResendKeepsOrder(t *testing.T) {
 				for range pending {
 					m, ok := <-answers
 					if !ok {
-						t.Error("connection closed")
+						// close(answers) happens after readErr is set.
+						t.Errorf("guest %d: connection closed in round %d: %v", client, round, readErr)
 						return
 					}
 					switch m["t"] {
@@ -859,7 +874,7 @@ func TestGuestBusyResendKeepsOrder(t *testing.T) {
 					}
 				}
 				if round == 0 {
-					firstRound.Done()
+					firstDone()
 				}
 				// The client waits a second, then resends what was not
 				// acknowledged in order, the first marked as a retry.
